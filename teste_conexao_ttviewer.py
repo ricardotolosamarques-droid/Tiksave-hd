@@ -6,7 +6,9 @@ import urllib.error
 URL = "https://ttviewer.org/api/highlights/"
 
 dados = {
-    "username": "brunaapetrucci"
+    "action": "posts",
+    "highlightId": "793616302084",
+    "cursor": "0"
 }
 
 requisicao = urllib.request.Request(
@@ -20,35 +22,31 @@ requisicao = urllib.request.Request(
     method="POST"
 )
 
-print("Testando consulta publica de Destaques...")
+print("Testando itens de um Destaque publico...")
 
 try:
-    with urllib.request.urlopen(
-        requisicao, timeout=20
-    ) as resposta:
+    with urllib.request.urlopen(requisicao, timeout=20) as resposta:
         print("HTTP:", resposta.status)
-
         resultado = json.load(resposta)
 
         if isinstance(resultado, dict):
-            print("Campos recebidos:", list(resultado.keys()))
+            print("Campos:", list(resultado.keys()))
 
-            colecoes = resultado.get("highlights")
+            itens = resultado.get("items", [])
+            print("Itens encontrados:", len(itens))
 
-            if isinstance(colecoes, list):
-                print("Colecoes encontradas:", len(colecoes))
-                for colecao in colecoes[:5]:
-                    print(
-                        "ID:", colecao.get("id"),
-                        "Titulo:", colecao.get("title")
-                    )
-            else:
-                print("Nenhuma lista de colecoes recebida.")
+            for item in itens[:5]:
+                print(
+                    "ID:", item.get("id"),
+                    "Video:", bool(item.get("videoUrl")),
+                    "Fotos:", len(item.get("images") or [])
+                )
+
+            print("Tem mais paginas:", resultado.get("hasMore"))
 
 except urllib.error.HTTPError as erro:
     print("HTTP:", erro.code)
-    print("A consulta nao foi aceita.")
-    print("Nao tentaremos contornar controles de acesso.")
+    print("Consulta recusada pelo servidor.")
 
 except urllib.error.URLError as erro:
-    print("Falha de conexao:", erro.reason)
+    print("Erro de conexao:", erro.reason)
