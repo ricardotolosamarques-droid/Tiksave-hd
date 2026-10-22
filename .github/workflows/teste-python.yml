@@ -26,3 +26,6 @@ jobs:
 
       - name: Testar conexao com TTViewer
         run: python teste_conexao_ttviewer.py
+
+      - name: Testar adaptador de Destaques
+        run: python -m unittest -v test_highlights_adapter.py
