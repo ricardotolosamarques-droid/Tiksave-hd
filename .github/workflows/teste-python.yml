@@ -23,3 +23,6 @@ jobs:
       - name: Verificar sintaxe
         run: |
           python -m py_compile main.py highlights_adapter.py
+
+      - name: Testar conexao com TTViewer
+        run: python teste_conexao_ttviewer.py
