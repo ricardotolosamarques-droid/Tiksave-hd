@@ -213,12 +213,11 @@ async def download_video(data: VideoRequest):
 
 # Nova API de Destaques
 
-from highlights_adapter import normalize_collections, normalize_items
 
 @app.get("/api/highlights")
 async def get_highlights(
     username: str = Query(..., min_length=1),
-    collection: str = Query("", description="ID da coleção"),
+    collection: str = Query(""),
     cursor: str = Query("0"),
 ):
     username = username.strip().lstrip("@")
@@ -227,6 +226,12 @@ async def get_highlights(
         raise HTTPException(
             status_code=400,
             detail="Nome de usuário inválido."
+        )
+
+    if collection and not re.fullmatch(r"[0-9]{1,30}", collection):
+        raise HTTPException(
+            status_code=400,
+            detail="Coleção inválida."
         )
 
     api_url = os.getenv("HIGHLIGHTS_API_URL", "").strip()
@@ -240,26 +245,21 @@ async def get_highlights(
     if not api_url.startswith("https://"):
         raise HTTPException(
             status_code=503,
-            detail="A URL da fonte de Destaques deve usar HTTPS."
+            detail="A fonte de Destaques precisa usar HTTPS."
         )
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            if collection:
-                response = await client.get(
-                    api_url,
-                    params={
-                        "username": username,
-                        "collection": collection,
-                        "cursor": cursor,
-                    },
-                )
-            else:
-                response = await client.get(
-                    api_url,
-                    params={"username": username},
-                )
+            params = {"username": username}
 
+            if collection:
+                params["collection"] = collection
+                params["cursor"] = cursor
+
+            response = await client.get(
+                api_url,
+                params=params
+            )
             response.raise_for_status()
             payload = response.json()
 
@@ -270,81 +270,14 @@ async def get_highlights(
 
         return normalize_collections(payload)
 
-    except httpx.HTTPStatusError as exc:
+    except httpx.HTTPError:
         raise HTTPException(
             status_code=502,
-            detail=f"A fonte de Destaques retornou HTTP {exc.response.status_code}.",
+            detail="Não foi possível consultar os Destaques."
         )
-    except (httpx.RequestError, ValueError) as exc:
+
+    except (ValueError, TypeError):
         raise HTTPException(
             status_code=502,
-            detail="Não foi possível consultar ou interpretar os Destaques.",
+            detail="A fonte retornou dados inválidos."
         )
-
-
-    data = payload.get("data") or {}
-    collections = data.get("collections") or []
-
-    if not isinstance(collections, list):
-        raise HTTPException(
-            status_code=502,
-            detail="Formato de coleções inesperado."
-        )
-
-    # Lista de capas e coleções
-    if not collection:
-        result = []
-
-        for item in collections:
-            if not isinstance(item, dict):
-                continue
-
-            collection_id = str(
-                item.get("collection_id") or ""
-            )
-
-            if not re.fullmatch(
-                r"[0-9]{1,30}", collection_id
-            ):
-                continue
-
-            result.append({
-                "id": collection_id,
-                "title": item.get("title") or "Destaque",
-                "cover": first_url(item.get("cover")),
-                "total_stories": item.get("total_stories", 0)
-            })
-
-        return {
-            "username": username,
-            "collections": result
-        }
-
-    # Fotos e vídeos de uma coleção
-    selected = next(
-        (
-            item for item in collections
-            if isinstance(item, dict)
-            and str(item.get("collection_id")) == collection
-        ),
-        None
-    )
-
-    if selected is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Coleção não encontrada."
-        )
-
-    stories = selected.get("stories") or []
-    items = []
-
-    for story in stories:
-        items.extend(extract_media(story))
-
-    return {
-        "username": username,
-        "collection": collection,
-        "items": items,
-        "next_cursor": None
-    }
