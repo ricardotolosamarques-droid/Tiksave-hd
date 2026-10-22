@@ -4,13 +4,13 @@ import re
 from urllib.parse import urlparse
 
 import httpx
+from highlights_adapter import normalize_collections, normalize_items
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 app = FastAPI(title="TikSave HD API")
 
-HIGHLIGHTS_API = "https://dev.omar-thing.site/api/v1/highlights"
 
 
 class VideoRequest(BaseModel):
@@ -212,72 +212,75 @@ async def download_video(data: VideoRequest):
 
 
 # Nova API de Destaques
+
+from highlights_adapter import normalize_collections, normalize_items
+
 @app.get("/api/highlights")
-async def highlights(
-    username: str = Query(...),
-    collection: str = "",
-    cursor: str = ""
+async def get_highlights(
+    username: str = Query(..., min_length=1),
+    collection: str = Query("", description="ID da coleção"),
+    cursor: str = Query("0"),
 ):
-    username = clean_username(username)
+    username = username.strip().lstrip("@")
 
-    if collection and not re.fullmatch(
-        r"[0-9]{1,30}", collection
-    ):
+    if not re.fullmatch(r"[A-Za-z0-9._]{2,24}", username):
         raise HTTPException(
             status_code=400,
-            detail="Coleção inválida."
+            detail="Nome de usuário inválido."
         )
 
-    if cursor and not re.fullmatch(
-        r"[A-Za-z0-9_-]{1,100}", cursor
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Cursor inválido."
-        )
+    api_url = os.getenv("HIGHLIGHTS_API_URL", "").strip()
 
-    api_key = os.getenv("HIGHLIGHTS_API_KEY", "")
-
-    if not api_key:
+    if not api_url:
         raise HTTPException(
             status_code=503,
-            detail="Configure HIGHLIGHTS_API_KEY no Render."
+            detail="A fonte de Destaques ainda não está configurada."
+        )
+
+    if not api_url.startswith("https://"):
+        raise HTTPException(
+            status_code=503,
+            detail="A URL da fonte de Destaques deve usar HTTPS."
         )
 
     try:
-        async with httpx.AsyncClient(
-            timeout=35
-        ) as client:
-            response = await client.get(
-                HIGHLIGHTS_API,
-                params={
-                    "username": username,
-                    "format": "clean",
-                    "key": api_key
-                },
-                headers={
-                    "Accept": "application/json"
-                }
-            )
+        async with httpx.AsyncClient(timeout=30) as client:
+            if collection:
+                response = await client.get(
+                    api_url,
+                    params={
+                        "username": username,
+                        "collection": collection,
+                        "cursor": cursor,
+                    },
+                )
+            else:
+                response = await client.get(
+                    api_url,
+                    params={"username": username},
+                )
+
             response.raise_for_status()
             payload = response.json()
 
-    except httpx.HTTPError:
+        if collection:
+            result = normalize_items(payload)
+            result["username"] = username
+            return result
+
+        return normalize_collections(payload)
+
+    except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=502,
-            detail="Não foi possível consultar os Destaques."
+            detail=f"A fonte de Destaques retornou HTTP {exc.response.status_code}.",
         )
-    except ValueError:
+    except (httpx.RequestError, ValueError) as exc:
         raise HTTPException(
             status_code=502,
-            detail="A API retornou uma resposta inválida."
+            detail="Não foi possível consultar ou interpretar os Destaques.",
         )
 
-    if payload.get("status") == "error":
-        raise HTTPException(
-            status_code=502,
-            detail="A API não conseguiu consultar o perfil."
-        )
 
     data = payload.get("data") or {}
     collections = data.get("collections") or []
