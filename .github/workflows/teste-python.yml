@@ -1,0 +1,25 @@
+
+name: Testar Python
+
+on:
+  push:
+    branches:
+      - teste-destaques
+  workflow_dispatch:
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verificar sintaxe
+        run: |
+          python -m py_compile main.py highlights_adapter.py
