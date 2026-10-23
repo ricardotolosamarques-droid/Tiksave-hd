@@ -1,115 +1,599 @@
-                status_code=503,
+
+import os
+import re
+import time
+from urllib.parse import urlparse, urljoin
+
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+
+from highlights_adapter import (
+    normalize_collections,
+    normalize_items,
+)
+
+app = FastAPI(title="TikSave HD API", version="2.3")
+
+SSSTIK_URL = "https://ssstik.io/"
+SSSTIK_API = "https://ssstik.io/abc?url=dl"
+
+COLLECTIONS_TTL = 86400
+ITEMS_TTL = 1800
+RATE_LIMIT_WAIT = 300
+
+cache = {}
+rate_limit_until = 0
+
+
+class VideoRequest(BaseModel):
+    url: str
+
+
+def valid_tiktok_url(url):
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+
+        return (
+            parsed.scheme == "https"
+            and (
+                host == "tiktok.com"
+                or host.endswith(".tiktok.com")
+            )
+            and not parsed.username
+            and not parsed.password
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def safe_media_url(value):
+    if not isinstance(value, str):
+        return None
+
+    try:
+        parsed = urlparse(value)
+
+        if (
+            parsed.scheme == "https"
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
+        ):
+            return value
+
+    except (ValueError, TypeError):
+        pass
+
+    return None
+
+
+def first_url(value):
+    if isinstance(value, str):
+        return safe_media_url(value)
+
+    if isinstance(value, list):
+        for item in value:
+            found = first_url(item)
+            if found:
+                return found
+
+    if isinstance(value, dict):
+        for key in ("url_list", "url", "uri"):
+            found = first_url(value.get(key))
+            if found:
+                return found
+
+    return None
+
+
+def extract_media(story):
+    if not isinstance(story, dict):
+        return []
+
+    results = []
+
+    video = story.get("video") or {}
+
+    if isinstance(video, dict):
+        url = (
+            first_url(video.get("play_addr"))
+            or first_url(video.get("download_addr"))
+            or first_url(video.get("url"))
+        )
+
+        if url:
+            results.append({
+                "type": "video",
+                "url": url,
+                "downloadAllowed": True
+            })
+
+    image_sources = []
+
+    for field in ("images", "image_post_info"):
+        value = story.get(field)
+
+        if isinstance(value, dict):
+            value = value.get("images", [])
+
+        if isinstance(value, list):
+            image_sources.extend(value)
+
+    images = []
+
+    for image in image_sources:
+        if isinstance(image, dict):
+            url = (
+                first_url(image.get("display_image"))
+                or first_url(
+                    image.get("owner_watermark_image")
+                )
+                or first_url(image.get("url_list"))
+                or first_url(image.get("url"))
+            )
+        else:
+            url = first_url(image)
+
+        if url and url not in images:
+            images.append(url)
+
+    if images:
+        results.append({
+            "type": "image",
+            "images": images,
+            "downloadAllowed": True
+        })
+
+    return results
+
+
+def clean_username(value):
+    value = value.strip()
+
+    if "tiktok.com/@" in value:
+        value = value.split("tiktok.com/@", 1)[1]
+        value = value.split("?", 1)[0].split("/", 1)[0]
+
+    value = value.lstrip("@")
+
+    if not re.fullmatch(
+        r"[A-Za-z0-9._]{2,24}", value
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Nome de usuário inválido."
+        )
+
+    return value
+
+
+def cache_get(key):
+    entry = cache.get(key)
+
+    if not entry:
+        return None
+
+    expires, value = entry
+
+    if time.monotonic() >= expires:
+        cache.pop(key, None)
+        return None
+
+    return value
+
+
+def cache_set(key, value, ttl):
+    cache[key] = (
+        time.monotonic() + ttl,
+        value
+    )
+
+
+def extract_ssstik_token(html):
+    patterns = [
+        r"""s_tt\s*=\s*['"]([^'"]+)['"]""",
+        r"""["']tt["']\s*:\s*["']([^"']+)["']""",
+        r"""name=["']tt["'][^>]*value=["']([^"']+)["']""",
+        r"""value=["']([^"']+)["'][^>]*name=["']tt["']""",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            html,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            return match.group(1)
+
+    return ""
+
+
+def extract_ssstik_links(html):
+    soup = BeautifulSoup(html, "html.parser")
+
+    links = []
+    seen = set()
+
+    for a in soup.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        label = a.get_text(" ", strip=True)
+
+        if not href:
+            continue
+
+        if href.startswith("//"):
+            href = "https:" + href
+
+        elif href.startswith("/"):
+            href = urljoin(SSSTIK_URL, href)
+
+        href = safe_media_url(href)
+
+        if not href or href in seen:
+            continue
+
+        label_lower = label.lower()
+
+        if not (
+            "download" in label_lower
+            or "baixar" in label_lower
+            or "marca" in label_lower
+            or "watermark" in label_lower
+            or "mp3" in label_lower
+            or "audio" in label_lower
+            or "áudio" in label_lower
+            or "hd" in label_lower
+        ):
+            continue
+
+        seen.add(href)
+
+        links.append({
+            "url": href,
+            "label": label or "Baixar vídeo"
+        })
+
+    def priority(item):
+        label = item["label"].lower()
+
+        if re.search(
+            r"\bhd\b|1080p|high quality",
+            label
+        ):
+            return 0
+
+        if (
+            "sem marca" in label
+            or "without watermark" in label
+            or "no watermark" in label
+        ):
+            return 1
+
+        if (
+            "mp3" in label
+            or "audio" in label
+            or "áudio" in label
+        ):
+            return 3
+
+        return 2
+
+    links.sort(key=priority)
+
+    return links
+
+
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "TikSave HD",
+        "version": "2.3",
+        "download_source": "SSSTik"
+    }
+
+
+@app.post("/api/download")
+async def download_video(data: VideoRequest):
+    if not valid_tiktok_url(data.url):
+        raise HTTPException(
+            status_code=400,
+            detail="Insira um link HTTPS válido do TikTok."
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/130.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            }
+        ) as client:
+
+            page = await client.get(SSSTIK_URL)
+            page.raise_for_status()
+
+            token = extract_ssstik_token(
+                page.text
+            )
+
+            response = await client.post(
+                SSSTIK_API,
+                data={
+                    "id": data.url,
+                    "locale": "pt",
+                    "tt": token
+                },
+                headers={
+                    "Accept": "text/html, */*",
+                    "Content-Type": (
+                        "application/x-www-form-urlencoded"
+                    ),
+                    "HX-Request": "true",
+                    "HX-Target": "target",
+                    "HX-Trigger": "_gcaptcha_pt",
+                    "Origin": "https://ssstik.io",
+                    "Referer": SSSTIK_URL
+                }
+            )
+
+            response.raise_for_status()
+
+            links = extract_ssstik_links(
+                response.text
+            )
+
+        if not links:
+            raise HTTPException(
+                status_code=422,
                 detail=(
-                    "Fonte temporariamente limitada. "
-                    "Tente novamente mais tarde."
+                    "O SSSTik não retornou links "
+                    "de download reconhecidos."
                 )
             )
 
-        try:
-            async with httpx.AsyncClient(
-                timeout=30,
-                follow_redirects=False
-            ) as client:
+        has_hd = any(
+            re.search(
+                r"\bhd\b|1080p|high quality",
+                item["label"],
+                re.IGNORECASE
+            )
+            for item in links
+        )
 
-                if method == "POST":
-                    if collection:
-                        body = {
-                            "action": "posts",
-                            "highlightId": collection,
-                            "cursor": cursor
-                        }
-                    else:
-                        body = {
-                            "username": username
-                        }
+        return {
+            "status": "ok",
+            "source": "ssstik",
+            "hd_available": has_hd,
+            "links": links
+        }
 
-                    response = await client.post(
-                        api_url,
-                        json=body,
-                        headers={
-                            "Accept": "application/json",
-                            "Content-Type": "application/json"
-                        }
-                    )
+    except HTTPException:
+        raise
 
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "O SSSTik retornou HTTP "
+                f"{exc.response.status_code}."
+            )
+        )
+
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail="Serviço SSSTik indisponível."
+        )
+
+
+@app.get("/api/highlights")
+async def get_highlights(
+    username: str = Query(..., min_length=1),
+    collection: str = Query(""),
+    cursor: str = Query("0"),
+):
+    global rate_limit_until
+
+    username = clean_username(username)
+
+    if collection and not re.fullmatch(
+        r"[0-9]{1,30}", collection
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Coleção inválida."
+        )
+
+    if not re.fullmatch(r"[0-9]{1,30}", cursor):
+        raise HTTPException(
+            status_code=400,
+            detail="Cursor inválido."
+        )
+
+    api_url = os.getenv(
+        "HIGHLIGHTS_API_URL", ""
+    ).strip()
+
+    method = os.getenv(
+        "HIGHLIGHTS_API_METHOD", "GET"
+    ).strip().upper()
+
+    if not api_url:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "A fonte de Destaques "
+                "não está configurada."
+            )
+        )
+
+    if not api_url.startswith("https://"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "A fonte de Destaques "
+                "precisa usar HTTPS."
+            )
+        )
+
+    if method not in ("GET", "POST"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Método da fonte de Destaques inválido."
+            )
+        )
+
+    cache_key = (
+        username,
+        collection,
+        cursor
+    )
+
+    cached = cache_get(cache_key)
+
+    if cached is not None:
+        return cached
+
+    if time.monotonic() < rate_limit_until:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Fonte temporariamente limitada. "
+                "Tente novamente mais tarde."
+            )
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=False
+        ) as client:
+
+            if method == "POST":
+                if collection:
+                    body = {
+                        "action": "posts",
+                        "highlightId": collection,
+                        "cursor": cursor
+                    }
                 else:
-                    params = {"username": username}
+                    body = {
+                        "username": username
+                    }
 
-                    if collection:
-                        params["collection"] = collection
-                        params["cursor"] = cursor
-
-                    response = await client.get(
-                        api_url,
-                        params=params,
-                        headers={
-                            "Accept": "application/json"
-                        }
-                    )
-
-                if response.status_code == 429:
-                    wait_seconds = RATE_LIMIT_WAIT
-
-                    retry_after = response.headers.get(
-                        "Retry-After", ""
-                    )
-
-                    if retry_after.isdigit():
-                        wait_seconds = max(
-                            wait_seconds,
-                            int(retry_after)
-                        )
-
-                    rate_limit_until = (
-                        time.monotonic() + wait_seconds
-                    )
-
-                    raise HTTPException(
-                        status_code=503,
-                        detail=(
-                            "Limite de consultas do provedor "
-                            "atingido. Tente mais tarde."
-                        )
-                    )
-
-                response.raise_for_status()
-                payload = response.json()
-
-            if collection:
-                result = normalize_items(payload)
-                result["username"] = username
-                result["collection"] = collection
-
-                ttl = ITEMS_TTL
-            else:
-                result = normalize_collections(payload)
-
-                ttl = COLLECTIONS_TTL
-
-            cache_set(cache_key, result, ttl)
-
-            return result
-
-        except HTTPException:
-            raise
-
-        except httpx.HTTPStatusError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "A fonte de Destaques retornou HTTP "
-                    f"{exc.response.status_code}."
+                response = await client.post(
+                    api_url,
+                    json=body,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json"
+                    }
                 )
-            )
 
-        except httpx.HTTPError:
-            raise HTTPException(
-                status_code=502,
-                detail="Não foi possível consultar os Destaques."
-            )
+            else:
+                params = {
+                    "username": username
+                }
 
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=502,
-                detail="A fonte retornou dados inválidos."
+                if collection:
+                    params["collection"] = collection
+                    params["cursor"] = cursor
+
+                response = await client.get(
+                    api_url,
+                    params=params,
+                    headers={
+                        "Accept": "application/json"
+                    }
+                )
+
+            if response.status_code == 429:
+                wait_seconds = RATE_LIMIT_WAIT
+
+                retry_after = response.headers.get(
+                    "Retry-After", ""
+                )
+
+                if retry_after.isdigit():
+                    wait_seconds = max(
+                        wait_seconds,
+                        int(retry_after)
+                    )
+
+                rate_limit_until = (
+                    time.monotonic() + wait_seconds
+                )
+
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Limite de consultas do provedor "
+                        "atingido. Tente mais tarde."
+                    )
+                )
+
+            response.raise_for_status()
+            payload = response.json()
+
+        if collection:
+            result = normalize_items(payload)
+
+            result["username"] = username
+            result["collection"] = collection
+
+            ttl = ITEMS_TTL
+
+        else:
+            result = normalize_collections(payload)
+            ttl = COLLECTIONS_TTL
+
+        cache_set(
+            cache_key,
+            result,
+            ttl
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "A fonte de Destaques retornou HTTP "
+                f"{exc.response.status_code}."
             )
+        )
+
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Não foi possível consultar "
+                "os Destaques."
+            )
+        )
+
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "A fonte retornou dados inválidos."
+            )
+        )
