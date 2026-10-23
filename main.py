@@ -14,10 +14,13 @@ from highlights_adapter import (
     normalize_items,
 )
 
-app = FastAPI(title="TikSave HD API", version="2.3")
+app = FastAPI(
+    title="TikSave HD API",
+    version="2.4"
+)
 
-SSSTIK_URL = "https://ssstik.io/"
-SSSTIK_API = "https://ssstik.io/abc?url=dl"
+SSSTIK_HOME = "https://ssstik.io/"
+SSSTIK_ENDPOINT = "https://ssstik.io/abc?url=dl"
 
 COLLECTIONS_TTL = 86400
 ITEMS_TTL = 1800
@@ -31,9 +34,9 @@ class VideoRequest(BaseModel):
     url: str
 
 
-def valid_tiktok_url(url):
+def valid_tiktok_url(value):
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(value)
         host = (parsed.hostname or "").lower()
 
         return (
@@ -63,7 +66,6 @@ def safe_media_url(value):
             and not parsed.password
         ):
             return value
-
     except (ValueError, TypeError):
         pass
 
@@ -94,7 +96,6 @@ def extract_media(story):
         return []
 
     results = []
-
     video = story.get("video") or {}
 
     if isinstance(video, dict):
@@ -160,7 +161,8 @@ def clean_username(value):
     value = value.lstrip("@")
 
     if not re.fullmatch(
-        r"[A-Za-z0-9._]{2,24}", value
+        r"[A-Za-z0-9._]{2,24}",
+        value
     ):
         raise HTTPException(
             status_code=400,
@@ -204,7 +206,7 @@ def extract_ssstik_token(html):
         match = re.search(
             pattern,
             html,
-            flags=re.IGNORECASE
+            re.IGNORECASE
         )
 
         if match:
@@ -219,43 +221,85 @@ def extract_ssstik_links(html):
     links = []
     seen = set()
 
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        label = a.get_text(" ", strip=True)
+    for element in soup.select(
+        "a[href], a[data-href], "
+        "a[data-url], a[data-download], "
+        "button[data-href], button[data-url]"
+    ):
+        href = ""
+
+        for attribute in (
+            "href",
+            "data-href",
+            "data-url",
+            "data-download"
+        ):
+            value = element.get(attribute)
+
+            if isinstance(value, str) and value.strip():
+                href = value.strip()
+                break
 
         if not href:
             continue
 
-        if href.startswith("//"):
-            href = "https:" + href
-
-        elif href.startswith("/"):
-            href = urljoin(SSSTIK_URL, href)
-
+        href = urljoin(SSSTIK_HOME, href)
         href = safe_media_url(href)
 
         if not href or href in seen:
             continue
 
-        label_lower = label.lower()
+        label = element.get_text(" ", strip=True)
 
-        if not (
-            "download" in label_lower
-            or "baixar" in label_lower
-            or "marca" in label_lower
-            or "watermark" in label_lower
-            or "mp3" in label_lower
-            or "audio" in label_lower
-            or "áudio" in label_lower
-            or "hd" in label_lower
+        title = element.get("title", "")
+        aria = element.get("aria-label", "")
+
+        description = " ".join([
+            label,
+            str(title),
+            str(aria),
+            str(element.get("class", "")),
+        ]).lower()
+
+        if not any(
+            keyword in description
+            for keyword in (
+                "download",
+                "baixar",
+                "watermark",
+                "marca",
+                "hd",
+                "1080",
+                "quality",
+                "mp3",
+                "audio",
+                "áudio"
+            )
         ):
             continue
 
+        if href.startswith(SSSTIK_HOME):
+            parsed = urlparse(href)
+
+            if parsed.path in (
+                "/",
+                "/abc",
+                "/download"
+            ):
+                continue
+
         seen.add(href)
+
+        if not label:
+            label = (
+                str(aria)
+                or str(title)
+                or "Baixar vídeo"
+            )
 
         links.append({
             "url": href,
-            "label": label or "Baixar vídeo"
+            "label": label
         })
 
     def priority(item):
@@ -267,17 +311,23 @@ def extract_ssstik_links(html):
         ):
             return 0
 
-        if (
-            "sem marca" in label
-            or "without watermark" in label
-            or "no watermark" in label
+        if any(
+            word in label
+            for word in (
+                "sem marca",
+                "without watermark",
+                "no watermark"
+            )
         ):
             return 1
 
-        if (
-            "mp3" in label
-            or "audio" in label
-            or "áudio" in label
+        if any(
+            word in label
+            for word in (
+                "mp3",
+                "audio",
+                "áudio"
+            )
         ):
             return 3
 
@@ -293,7 +343,7 @@ def home():
     return {
         "status": "online",
         "service": "TikSave HD",
-        "version": "2.3",
+        "version": "2.4",
         "download_source": "SSSTik"
     }
 
@@ -318,11 +368,15 @@ async def download_video(data: VideoRequest):
                     "(KHTML, like Gecko) "
                     "Chrome/130.0.0.0 Safari/537.36"
                 ),
-                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+                "Accept-Language": (
+                    "pt-BR,pt;q=0.9,en;q=0.8"
+                )
             }
         ) as client:
 
-            page = await client.get(SSSTIK_URL)
+            page = await client.get(
+                SSSTIK_HOME
+            )
             page.raise_for_status()
 
             token = extract_ssstik_token(
@@ -330,7 +384,7 @@ async def download_video(data: VideoRequest):
             )
 
             response = await client.post(
-                SSSTIK_API,
+                SSSTIK_ENDPOINT,
                 data={
                     "id": data.url,
                     "locale": "pt",
@@ -338,29 +392,26 @@ async def download_video(data: VideoRequest):
                 },
                 headers={
                     "Accept": "text/html, */*",
-                    "Content-Type": (
-                        "application/x-www-form-urlencoded"
-                    ),
                     "HX-Request": "true",
                     "HX-Target": "target",
                     "HX-Trigger": "_gcaptcha_pt",
                     "Origin": "https://ssstik.io",
-                    "Referer": SSSTIK_URL
+                    "Referer": SSSTIK_HOME
                 }
             )
 
             response.raise_for_status()
 
-            links = extract_ssstik_links(
-                response.text
-            )
+        links = extract_ssstik_links(
+            response.text
+        )
 
         if not links:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "O SSSTik não retornou links "
-                    "de download reconhecidos."
+                    "O SSSTik não retornou "
+                    "links de download reconhecidos."
                 )
             )
 
@@ -376,7 +427,7 @@ async def download_video(data: VideoRequest):
         return {
             "status": "ok",
             "source": "ssstik",
-            "hd_available": has_hd,
+            "hd_available": bool(has_hd),
             "links": links
         }
 
@@ -403,21 +454,25 @@ async def download_video(data: VideoRequest):
 async def get_highlights(
     username: str = Query(..., min_length=1),
     collection: str = Query(""),
-    cursor: str = Query("0"),
+    cursor: str = Query("0")
 ):
     global rate_limit_until
 
     username = clean_username(username)
 
     if collection and not re.fullmatch(
-        r"[0-9]{1,30}", collection
+        r"[0-9]{1,30}",
+        collection
     ):
         raise HTTPException(
             status_code=400,
             detail="Coleção inválida."
         )
 
-    if not re.fullmatch(r"[0-9]{1,30}", cursor):
+    if not re.fullmatch(
+        r"[0-9]{1,30}",
+        cursor
+    ):
         raise HTTPException(
             status_code=400,
             detail="Cursor inválido."
@@ -428,7 +483,8 @@ async def get_highlights(
     ).strip()
 
     method = os.getenv(
-        "HIGHLIGHTS_API_METHOD", "GET"
+        "HIGHLIGHTS_API_METHOD",
+        "GET"
     ).strip().upper()
 
     if not api_url:
@@ -452,9 +508,7 @@ async def get_highlights(
     if method not in ("GET", "POST"):
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Método da fonte de Destaques inválido."
-            )
+            detail="Método de Destaques inválido."
         )
 
     cache_key = (
