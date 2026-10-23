@@ -14,9 +14,9 @@ from pydantic import BaseModel
 app = FastAPI(title="TikSave HD API")
 
 # Cache dos Destaques
-COLLECTIONS_TTL = 24 * 60 * 60  # 24 horas
-ITEMS_TTL = 30 * 60            # 30 minutos
-RATE_LIMIT_WAIT = 5 * 60       # 5 minutos
+COLLECTIONS_TTL = 24 * 60 * 60
+ITEMS_TTL = 30 * 60
+RATE_LIMIT_WAIT = 5 * 60
 
 highlights_cache = {}
 highlights_lock = asyncio.Lock()
@@ -86,7 +86,6 @@ def extract_media(story):
 
     results = []
 
-    # Vídeos
     video = story.get("video") or {}
 
     if isinstance(video, dict):
@@ -103,7 +102,6 @@ def extract_media(story):
                 "downloadAllowed": True
             })
 
-    # Fotos
     image_sources = []
 
     for field in ("images", "image_post_info"):
@@ -175,7 +173,6 @@ def cache_get(key):
 def cache_set(key, data, ttl):
     now = time.monotonic()
 
-    # Remove entradas expiradas
     expired = [
         k for k, v in highlights_cache.items()
         if v["expires"] <= now
@@ -190,16 +187,42 @@ def cache_set(key, data, ttl):
     }
 
 
+def prioridade_hd(link):
+    """
+    Ordena os links do SSSTik:
+    0 = HD
+    1 = Sem marca-d'água
+    2 = Outras opções
+    """
+    texto = str(link.get("label", "")).lower()
+
+    if (
+        "1080p" in texto
+        or "high quality" in texto
+        or re.search(r"\bhd\b", texto)
+    ):
+        return 0
+
+    if (
+        "without watermark" in texto
+        or "no watermark" in texto
+        or "sem marca" in texto
+    ):
+        return 1
+
+    return 2
+
+
 @app.get("/")
 def home():
     return {
         "status": "online",
         "service": "TikSave HD",
-        "version": "2.1"
+        "version": "2.2"
     }
 
 
-# Sistema de download mantido
+# Download de vídeos via SSSTik
 @app.post("/api/download")
 async def download_video(data: VideoRequest):
     if not valid_tiktok_url(data.url):
@@ -250,6 +273,9 @@ async def download_video(data: VideoRequest):
                 detail="Nenhum link encontrado."
             )
 
+        # Prioriza automaticamente links identificados como HD
+        links.sort(key=prioridade_hd)
+
         return {
             "status": "ok",
             "links": links
@@ -287,7 +313,6 @@ async def get_highlights(
 
     cache_key = (username.lower(), collection, cursor)
 
-    # Primeiro tenta usar o cache
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
@@ -322,10 +347,8 @@ async def get_highlights(
             detail="Método de consulta inválido."
         )
 
-    # Impede várias consultas simultâneas ao provedor
     async with highlights_lock:
 
-        # Outra requisição pode ter preenchido o cache
         cached = cache_get(cache_key)
         if cached is not None:
             return cached
@@ -382,7 +405,6 @@ async def get_highlights(
                     )
 
                 if response.status_code == 429:
-                    # Respeita o limite, sem tentar contorná-lo
                     wait_seconds = RATE_LIMIT_WAIT
 
                     retry_after = response.headers.get(
