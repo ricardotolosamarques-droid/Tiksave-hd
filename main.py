@@ -1,6 +1,8 @@
 
 import os
 import re
+import time
+import asyncio
 from urllib.parse import urlparse
 
 import httpx
@@ -10,6 +12,15 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 app = FastAPI(title="TikSave HD API")
+
+# Cache dos Destaques
+COLLECTIONS_TTL = 24 * 60 * 60  # 24 horas
+ITEMS_TTL = 30 * 60            # 30 minutos
+RATE_LIMIT_WAIT = 5 * 60       # 5 minutos
+
+highlights_cache = {}
+highlights_lock = asyncio.Lock()
+rate_limit_until = 0.0
 
 
 class VideoRequest(BaseModel):
@@ -148,16 +159,47 @@ def clean_username(value: str) -> str:
     return value
 
 
+def cache_get(key):
+    entry = highlights_cache.get(key)
+
+    if not entry:
+        return None
+
+    if time.monotonic() >= entry["expires"]:
+        highlights_cache.pop(key, None)
+        return None
+
+    return entry["data"]
+
+
+def cache_set(key, data, ttl):
+    now = time.monotonic()
+
+    # Remove entradas expiradas
+    expired = [
+        k for k, v in highlights_cache.items()
+        if v["expires"] <= now
+    ]
+
+    for k in expired:
+        highlights_cache.pop(k, None)
+
+    highlights_cache[key] = {
+        "data": data,
+        "expires": now + ttl
+    }
+
+
 @app.get("/")
 def home():
     return {
         "status": "online",
         "service": "TikSave HD",
-        "version": "2.0"
+        "version": "2.1"
     }
 
 
-# Mantém o sistema de download existente
+# Sistema de download mantido
 @app.post("/api/download")
 async def download_video(data: VideoRequest):
     if not valid_tiktok_url(data.url):
@@ -220,18 +262,15 @@ async def download_video(data: VideoRequest):
         )
 
 
-# API de Destaques
-# Aceita um provedor autorizado com GET ou POST.
-# Para provedores com POST, usa o formato:
-# {"username": "..."} ou
-# {"action": "posts", "highlightId": "...", "cursor": "0"}
-
+# API de Destaques com cache
 @app.get("/api/highlights")
 async def get_highlights(
     username: str = Query(..., min_length=1),
     collection: str = Query(""),
     cursor: str = Query("0"),
 ):
+    global rate_limit_until
+
     username = clean_username(username)
 
     if collection and not re.fullmatch(r"[0-9]{1,30}", collection):
@@ -246,6 +285,13 @@ async def get_highlights(
             detail="Cursor inválido."
         )
 
+    cache_key = (username.lower(), collection, cursor)
+
+    # Primeiro tenta usar o cache
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     api_url = os.getenv("HIGHLIGHTS_API_URL", "").strip()
     method = os.getenv(
         "HIGHLIGHTS_API_METHOD", "POST"
@@ -254,7 +300,7 @@ async def get_highlights(
     if not api_url:
         raise HTTPException(
             status_code=503,
-            detail="A fonte de Destaques ainda não está configurada."
+            detail="Fonte de Destaques não configurada."
         )
 
     parsed = urlparse(api_url)
@@ -267,85 +313,138 @@ async def get_highlights(
     ):
         raise HTTPException(
             status_code=503,
-            detail="A fonte de Destaques precisa usar HTTPS válido."
+            detail="Fonte de Destaques inválida."
         )
 
     if method not in ("GET", "POST"):
         raise HTTPException(
             status_code=503,
-            detail="Método da fonte de Destaques inválido."
+            detail="Método de consulta inválido."
         )
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=30,
-            follow_redirects=False
-        ) as client:
+    # Impede várias consultas simultâneas ao provedor
+    async with highlights_lock:
 
-            if method == "POST":
-                if collection:
-                    body = {
-                        "action": "posts",
-                        "highlightId": collection,
-                        "cursor": cursor
-                    }
+        # Outra requisição pode ter preenchido o cache
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        if time.monotonic() < rate_limit_until:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Fonte temporariamente limitada. "
+                    "Tente novamente mais tarde."
+                )
+            )
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=30,
+                follow_redirects=False
+            ) as client:
+
+                if method == "POST":
+                    if collection:
+                        body = {
+                            "action": "posts",
+                            "highlightId": collection,
+                            "cursor": cursor
+                        }
+                    else:
+                        body = {
+                            "username": username
+                        }
+
+                    response = await client.post(
+                        api_url,
+                        json=body,
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/json"
+                        }
+                    )
+
                 else:
-                    body = {
-                        "username": username
-                    }
+                    params = {"username": username}
 
-                response = await client.post(
-                    api_url,
-                    json=body,
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/json"
-                    }
-                )
+                    if collection:
+                        params["collection"] = collection
+                        params["cursor"] = cursor
 
+                    response = await client.get(
+                        api_url,
+                        params=params,
+                        headers={
+                            "Accept": "application/json"
+                        }
+                    )
+
+                if response.status_code == 429:
+                    # Respeita o limite, sem tentar contorná-lo
+                    wait_seconds = RATE_LIMIT_WAIT
+
+                    retry_after = response.headers.get(
+                        "Retry-After", ""
+                    )
+
+                    if retry_after.isdigit():
+                        wait_seconds = max(
+                            wait_seconds,
+                            int(retry_after)
+                        )
+
+                    rate_limit_until = (
+                        time.monotonic() + wait_seconds
+                    )
+
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Limite de consultas do provedor "
+                            "atingido. Tente mais tarde."
+                        )
+                    )
+
+                response.raise_for_status()
+                payload = response.json()
+
+            if collection:
+                result = normalize_items(payload)
+                result["username"] = username
+                result["collection"] = collection
+
+                ttl = ITEMS_TTL
             else:
-                params = {"username": username}
+                result = normalize_collections(payload)
 
-                if collection:
-                    params["collection"] = collection
-                    params["cursor"] = cursor
+                ttl = COLLECTIONS_TTL
 
-                response = await client.get(
-                    api_url,
-                    params=params,
-                    headers={
-                        "Accept": "application/json"
-                    }
-                )
+            cache_set(cache_key, result, ttl)
 
-            response.raise_for_status()
-            payload = response.json()
-
-        if collection:
-            result = normalize_items(payload)
-            result["username"] = username
-            result["collection"] = collection
             return result
 
-        return normalize_collections(payload)
+        except HTTPException:
+            raise
 
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "A fonte de Destaques retornou HTTP "
-                f"{exc.response.status_code}."
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "A fonte de Destaques retornou HTTP "
+                    f"{exc.response.status_code}."
+                )
             )
-        )
 
-    except httpx.HTTPError:
-        raise HTTPException(
-            status_code=502,
-            detail="Não foi possível consultar os Destaques."
-        )
+        except httpx.HTTPError:
+            raise HTTPException(
+                status_code=502,
+                detail="Não foi possível consultar os Destaques."
+            )
 
-    except (ValueError, TypeError):
-        raise HTTPException(
-            status_code=502,
-            detail="A fonte retornou dados inválidos."
-        )
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=502,
+                detail="A fonte retornou dados inválidos."
+            )
