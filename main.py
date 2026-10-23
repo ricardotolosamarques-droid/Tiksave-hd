@@ -12,7 +12,6 @@ from pydantic import BaseModel
 app = FastAPI(title="TikSave HD API")
 
 
-
 class VideoRequest(BaseModel):
     url: str
 
@@ -35,6 +34,7 @@ def valid_tiktok_url(url: str) -> bool:
 def safe_media_url(value):
     if not isinstance(value, str):
         return None
+
     try:
         parsed = urlparse(value)
         if (
@@ -46,22 +46,26 @@ def safe_media_url(value):
             return value
     except ValueError:
         pass
+
     return None
 
 
 def first_url(value):
     if isinstance(value, str):
         return safe_media_url(value)
+
     if isinstance(value, list):
         for item in value:
             found = first_url(item)
             if found:
                 return found
+
     if isinstance(value, dict):
         for key in ("url_list", "url", "uri"):
             found = first_url(value.get(key))
             if found:
                 return found
+
     return None
 
 
@@ -73,12 +77,14 @@ def extract_media(story):
 
     # Vídeos
     video = story.get("video") or {}
+
     if isinstance(video, dict):
         url = (
             first_url(video.get("play_addr"))
             or first_url(video.get("download_addr"))
             or first_url(video.get("url"))
         )
+
         if url:
             results.append({
                 "type": "video",
@@ -177,16 +183,19 @@ async def download_video(data: VideoRequest):
                     "Accept": "text/html"
                 }
             )
+
             response.raise_for_status()
 
         soup = BeautifulSoup(
-            response.text, "html.parser"
+            response.text,
+            "html.parser"
         )
 
         links = []
 
         for a in soup.select("a[href]"):
             href = a.get("href", "")
+
             if href.startswith("https://"):
                 links.append({
                     "url": href,
@@ -211,8 +220,11 @@ async def download_video(data: VideoRequest):
         )
 
 
-# Nova API de Destaques
-
+# API de Destaques
+# Aceita um provedor autorizado com GET ou POST.
+# Para provedores com POST, usa o formato:
+# {"username": "..."} ou
+# {"action": "posts", "highlightId": "...", "cursor": "0"}
 
 @app.get("/api/highlights")
 async def get_highlights(
@@ -220,13 +232,7 @@ async def get_highlights(
     collection: str = Query(""),
     cursor: str = Query("0"),
 ):
-    username = username.strip().lstrip("@")
-
-    if not re.fullmatch(r"[A-Za-z0-9._]{2,24}", username):
-        raise HTTPException(
-            status_code=400,
-            detail="Nome de usuário inválido."
-        )
+    username = clean_username(username)
 
     if collection and not re.fullmatch(r"[0-9]{1,30}", collection):
         raise HTTPException(
@@ -234,7 +240,16 @@ async def get_highlights(
             detail="Coleção inválida."
         )
 
+    if not re.fullmatch(r"[0-9]{1,30}", cursor):
+        raise HTTPException(
+            status_code=400,
+            detail="Cursor inválido."
+        )
+
     api_url = os.getenv("HIGHLIGHTS_API_URL", "").strip()
+    method = os.getenv(
+        "HIGHLIGHTS_API_METHOD", "POST"
+    ).strip().upper()
 
     if not api_url:
         raise HTTPException(
@@ -242,33 +257,86 @@ async def get_highlights(
             detail="A fonte de Destaques ainda não está configurada."
         )
 
-    if not api_url.startswith("https://"):
+    parsed = urlparse(api_url)
+
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
         raise HTTPException(
             status_code=503,
-            detail="A fonte de Destaques precisa usar HTTPS."
+            detail="A fonte de Destaques precisa usar HTTPS válido."
+        )
+
+    if method not in ("GET", "POST"):
+        raise HTTPException(
+            status_code=503,
+            detail="Método da fonte de Destaques inválido."
         )
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            params = {"username": username}
+        async with httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=False
+        ) as client:
 
-            if collection:
-                params["collection"] = collection
-                params["cursor"] = cursor
+            if method == "POST":
+                if collection:
+                    body = {
+                        "action": "posts",
+                        "highlightId": collection,
+                        "cursor": cursor
+                    }
+                else:
+                    body = {
+                        "username": username
+                    }
 
-            response = await client.get(
-                api_url,
-                params=params
-            )
+                response = await client.post(
+                    api_url,
+                    json=body,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json"
+                    }
+                )
+
+            else:
+                params = {"username": username}
+
+                if collection:
+                    params["collection"] = collection
+                    params["cursor"] = cursor
+
+                response = await client.get(
+                    api_url,
+                    params=params,
+                    headers={
+                        "Accept": "application/json"
+                    }
+                )
+
             response.raise_for_status()
             payload = response.json()
 
         if collection:
             result = normalize_items(payload)
             result["username"] = username
+            result["collection"] = collection
             return result
 
         return normalize_collections(payload)
+
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "A fonte de Destaques retornou HTTP "
+                f"{exc.response.status_code}."
+            )
+        )
 
     except httpx.HTTPError:
         raise HTTPException(
