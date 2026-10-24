@@ -200,6 +200,35 @@ async def _ssstik_fallback(video_url):
     except (httpx.HTTPError, ValueError):
         return []
 
+async def _cobalt_fallback(video_url):
+    # Separate self-hosted Cobalt instance; never proxy media through this API.
+    cobalt_url = os.getenv("COBALT_URL", "https://tiksave-cobalt.onrender.com").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=18, follow_redirects=False) as client:
+            response = await client.post(
+                cobalt_url + "/",
+                json={"url": video_url, "videoQuality": "max", "downloadMode": "auto"},
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        status = data.get("status")
+        target = data.get("url")
+        if status not in ("redirect", "tunnel") or not isinstance(target, str):
+            return [], str(data.get("error") or status or "resposta_sem_link")[:120]
+        parsed = urlparse(target)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return [], "url_invalida"
+        return [{
+            "url": target,
+            "label": "Cobalt • download",
+            "source": "cobalt",
+            "quality_verified": False,
+        }], "1_link"
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        return [], type(exc).__name__
+
+
 @app.get("/")
 def health():
     return {"status": "online", "service": "TikSave HD", "version": "3.2.2"}
@@ -259,9 +288,13 @@ async def download_video(data: VideoRequest):
         if len(links) >= 12:
             break
     # Direct links avoid Render proxy bandwidth and the CDN 403 seen in logs.
-    direct_links = await _ssstik_fallback(data.url)
+    direct_links, cobalt_result = await asyncio.gather(
+        _ssstik_fallback(data.url), _cobalt_fallback(data.url)
+    )
+    cobalt_links, cobalt_status = cobalt_result
     diagnostic["ssstik"] = f"{len(direct_links)}_links"
-    links = direct_links + links
+    diagnostic["cobalt"] = cobalt_status
+    links = direct_links + cobalt_links + links
     if not links:
         raise HTTPException(status_code=502, detail={
             "message": "yt-dlp não encontrou links de vídeo disponíveis.",
