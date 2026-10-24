@@ -201,32 +201,45 @@ async def _ssstik_fallback(video_url):
         return []
 
 async def _cobalt_fallback(video_url):
-    # Separate self-hosted Cobalt instance; never proxy media through this API.
+    # Wake a sleeping Render instance and retry a transient network timeout.
     cobalt_url = os.getenv("COBALT_URL", "https://tiksave-cobalt.onrender.com").rstrip("/")
+    timeout = httpx.Timeout(connect=10, read=24, write=10, pool=5)
     try:
-        async with httpx.AsyncClient(timeout=18, follow_redirects=False) as client:
-            response = await client.post(
-                cobalt_url + "/",
-                json={"url": video_url, "videoQuality": "max", "downloadMode": "auto"},
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            data = response.json()
-        status = data.get("status")
-        target = data.get("url")
-        if status not in ("redirect", "tunnel") or not isinstance(target, str):
-            return [], str(data.get("error") or status or "resposta_sem_link")[:120]
-        parsed = urlparse(target)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-            return [], "url_invalida"
-        return [{
-            "url": target,
-            "label": "Cobalt • download",
-            "source": "cobalt",
-            "quality_verified": False,
-        }], "1_link"
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            try:
+                await client.get(cobalt_url + "/", timeout=10)
+            except httpx.HTTPError:
+                pass  # A failed wake request should not prevent the actual POST.
+            for attempt in range(2):
+                try:
+                    response = await client.post(
+                        cobalt_url + "/",
+                        json={"url": video_url, "videoQuality": "max", "downloadMode": "auto"},
+                        headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    status = data.get("status")
+                    target = data.get("url")
+                    if status not in ("redirect", "tunnel") or not isinstance(target, str):
+                        error = data.get("error")
+                        if isinstance(error, dict):
+                            error = error.get("code") or error.get("message")
+                        return [], str(error or status or "resposta_sem_link")[:120]
+                    parsed = urlparse(target)
+                    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                        return [], "url_invalida"
+                    return [{
+                        "url": target, "label": "Cobalt • download",
+                        "source": "cobalt", "quality_verified": False,
+                    }], "1_link"
+                except (httpx.TimeoutException, httpx.ConnectError) as exc:
+                    if attempt == 1:
+                        return [], type(exc).__name__ + "_apos_2_tentativas"
+                    await asyncio.sleep(1)
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         return [], type(exc).__name__
+    return [], "sem_resposta"
 
 
 @app.get("/")
