@@ -277,32 +277,74 @@ async def _tikwm_fallback(video_url):
 async def download_video(data: VideoRequest):
     if not valid_tiktok_url(data.url):
         raise HTTPException(status_code=400, detail="Link HTTPS do TikTok inválido.")
-    ssstik_links, cobalt_result, tikwm_result = await asyncio.gather(
-        _ssstik_fallback(data.url),
-        _cobalt_fallback(data.url),
-        _tikwm_fallback(data.url),
+    diagnostic = {}
+    try:
+        candidates = await asyncio.wait_for(
+            asyncio.to_thread(_extract_ytdlp, data.url), timeout=35
+        )
+        diagnostic["yt_dlp"] = f"{len(candidates)}_formatos"
+    except asyncio.TimeoutError:
+        candidates = []
+        diagnostic["yt_dlp"] = "tempo_esgotado"
+    except Exception as exc:
+        candidates = []
+        diagnostic["yt_dlp"] = type(exc).__name__
+    links = []
+    seen = set()
+    for fmt in sorted(
+        candidates,
+        key=lambda f: (f["width"] * f["height"], f["bitrate_kbps"]),
+        reverse=True
+    ):
+        token = _make_token(fmt["url"], fmt["http_headers"])
+        if not token:
+            continue
+        key = (fmt["width"], fmt["height"], round(fmt["bitrate_kbps"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        width, height = fmt["width"], fmt["height"]
+        # Experimental direct CDN URL: the browser, not Render, requests the media.
+        # Keep the existing proxy as a separate fallback. URLs are short-lived and
+        # may require headers/cookies that browsers cannot supply.
+        links.append({
+            "url": fmt["url"],
+            "label": f"yt-dlp direto • {width}x{height}" if width and height else "yt-dlp direto • qualidade não verificada",
+            "source": "yt-dlp-direct", "width": width or None,
+            "height": height or None,
+            "bitrate_kbps": fmt["bitrate_kbps"] or None,
+            "quality_verified": bool(width and height),
+            "experimental": True,
+        })
+        links.append({
+            "url": "/api/file?token=" + token,
+            "label": f"yt-dlp proxy • {width}x{height}" if width and height else "yt-dlp proxy • qualidade não verificada",
+            "source": "yt-dlp", "width": width or None,
+            "height": height or None,
+            "bitrate_kbps": fmt["bitrate_kbps"] or None,
+            "quality_verified": bool(width and height),
+        })
+        if len(links) >= 12:
+            break
+    # Direct links avoid Render proxy bandwidth and the CDN 403 seen in logs.
+    direct_links, cobalt_result, tikwm_result = await asyncio.gather(
+        _ssstik_fallback(data.url), _cobalt_fallback(data.url), _tikwm_fallback(data.url)
     )
     cobalt_links, cobalt_status = cobalt_result
     tikwm_links, tikwm_status = tikwm_result
-    links = ssstik_links + cobalt_links + tikwm_links
-    diagnostic = {
-        "ssstik": f"{len(ssstik_links)}_links",
-        "cobalt": cobalt_status,
-        "tikwm": tikwm_status,
-    }
+    diagnostic["tikwm"] = tikwm_status
+    diagnostic["ssstik"] = f"{len(direct_links)}_links"
+    diagnostic["cobalt"] = cobalt_status
+    links = direct_links + cobalt_links + tikwm_links + links
     if not links:
         raise HTTPException(status_code=502, detail={
             "message": "Nenhuma fonte encontrou links disponíveis.",
-            "diagnostic": diagnostic,
+            "diagnostic": diagnostic
         })
     return {
-        "status": "ok",
-        "source": links[0]["source"],
-        "links": links,
-        "hd_available": any(link.get("source") == "tikwm" and
-                            "HD" in link.get("label", "") for link in links),
-        "preview_url": None,
-        "diagnostic": diagnostic,
+        "status": "ok", "source": links[0]["source"], "links": links,
+        "hd_available": any((link.get("height") or 0) >= 720 for link in links) or any(link.get("source") == "tikwm" and "HD" in link.get("label", "") for link in links),
+        "preview_url": None, "diagnostic": diagnostic
     }
 
 
