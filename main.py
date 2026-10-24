@@ -16,7 +16,7 @@ from highlights_adapter import (
 
 app = FastAPI(
     title="TikSave HD API",
-    version="2.5"
+    version="2.6"
 )
 
 SSSTIK_HOME = "https://ssstik.io/"
@@ -340,18 +340,7 @@ def extract_ssstik_links(html):
     return links
 
 
-@app.get("/")
-def home():
-    return {
-        "status": "online",
-        "service": "TikSave HD",
-        "version": "2.5",
-        "download_source": "TikDownloader / SSSTik"
-    }
-
-
 def extract_tikdownloader_links(html):
-    """Extract explicit download anchors; never label a regular video as HD."""
     soup = BeautifulSoup(html, "html.parser")
     links = []
     seen = set()
@@ -415,7 +404,6 @@ def extract_tikdownloader_links(html):
 
 
 async def try_tikdownloader(client, video_url):
-    # O endpoint pode mudar ou bloquear requisições do Render.
     response = await client.post(
         TIKDOWNLOADER_ENDPOINT,
         data={
@@ -478,6 +466,17 @@ async def try_ssstik(client, video_url):
     return extract_ssstik_links(response.text)
 
 
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "TikSave HD",
+        "version": "2.6",
+        "download_source": "TikDownloader / SSSTik",
+        "diagnostic_enabled": True
+    }
+
+
 @app.post("/api/download")
 async def download_video(data: VideoRequest):
     if not valid_tiktok_url(data.url):
@@ -495,55 +494,108 @@ async def download_video(data: VideoRequest):
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
     }
 
+    diagnostic = {
+        "tikdownloader": "nao_consultado",
+        "ssstik": "nao_consultado"
+    }
+
     async with httpx.AsyncClient(
         timeout=30,
         follow_redirects=True,
         headers=headers
     ) as client:
 
-        for source, fetch in (
-            ("tikdownloader", try_tikdownloader),
-            ("ssstik", try_ssstik),
-        ):
-            try:
-                links = await fetch(client, data.url)
-
-            except (
-                httpx.HTTPError,
-                ValueError,
-                TypeError
-            ):
-                continue
-
-            if not links:
-                continue
+        try:
+            links = await try_tikdownloader(
+                client, data.url
+            )
 
             has_hd = any(
                 re.search(
                     r"\bhd\b|1080p|full\s*hd",
-                    link["label"],
+                    item["label"],
                     re.I
                 )
-                for link in links
+                for item in links
             )
 
-            # Prioriza HD verdadeiro; usa SSSTik como reserva.
-            if source == "tikdownloader" and not has_hd:
-                continue
+            diagnostic["tikdownloader"] = (
+                "hd_encontrado" if has_hd
+                else f"sem_hd_reconhecido_{len(links)}_links"
+            )
 
-            return {
-                "status": "ok",
-                "source": source,
-                "hd_available": bool(has_hd),
-                "links": links,
-            }
+            if has_hd:
+                return {
+                    "status": "ok",
+                    "source": "tikdownloader",
+                    "hd_available": True,
+                    "links": links,
+                    "diagnostic": diagnostic
+                }
+
+        except httpx.HTTPStatusError as exc:
+            diagnostic["tikdownloader"] = (
+                f"http_{exc.response.status_code}"
+            )
+
+        except httpx.RequestError as exc:
+            diagnostic["tikdownloader"] = (
+                f"erro_conexao_{type(exc).__name__}"
+            )
+
+        except (ValueError, TypeError) as exc:
+            diagnostic["tikdownloader"] = (
+                f"erro_resposta_{type(exc).__name__}"
+            )
+
+        try:
+            links = await try_ssstik(
+                client, data.url
+            )
+
+            has_hd = any(
+                re.search(
+                    r"\bhd\b|1080p|high quality",
+                    item["label"],
+                    re.I
+                )
+                for item in links
+            )
+
+            diagnostic["ssstik"] = (
+                f"{len(links)}_links_encontrados"
+            )
+
+            if links:
+                return {
+                    "status": "ok",
+                    "source": "ssstik",
+                    "hd_available": bool(has_hd),
+                    "links": links,
+                    "diagnostic": diagnostic
+                }
+
+        except httpx.HTTPStatusError as exc:
+            diagnostic["ssstik"] = (
+                f"http_{exc.response.status_code}"
+            )
+
+        except httpx.RequestError as exc:
+            diagnostic["ssstik"] = (
+                f"erro_conexao_{type(exc).__name__}"
+            )
+
+        except (ValueError, TypeError) as exc:
+            diagnostic["ssstik"] = (
+                f"erro_resposta_{type(exc).__name__}"
+            )
 
     raise HTTPException(
         status_code=502,
-        detail=(
-            "Nenhum provedor retornou "
-            "links de vídeo reconhecidos."
-        )
+        detail={
+            "message": "Nenhum provedor retornou links.",
+            "diagnostic": diagnostic
+        }
     )
 
 
