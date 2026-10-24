@@ -257,7 +257,7 @@ async def download_video(data: VideoRequest):
         })
     return {
         "status": "ok", "source": "yt-dlp", "links": links,
-        "hd_available": any((link["height"] or 0) >= 720 for link in links),
+        "hd_available": any((link.get("height") or 0) >= 720 for link in links),
         "preview_url": None, "diagnostic": diagnostic
     }
 
