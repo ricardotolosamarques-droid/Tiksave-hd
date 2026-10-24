@@ -3,6 +3,8 @@ import os
 import re
 import time
 import asyncio
+import json
+import subprocess
 from urllib.parse import urlparse, urljoin
 
 import httpx
@@ -14,7 +16,7 @@ from pydantic import BaseModel
 from highlights_adapter import normalize_collections, normalize_items
 
 
-app = FastAPI(title="TikSave HD API", version="2.8")
+app = FastAPI(title="TikSave HD API", version="2.9")
 
 SSSTIK_HOME = "https://ssstik.io/"
 SSSTIK_ENDPOINT = "https://ssstik.io/abc?url=dl"
@@ -33,17 +35,17 @@ class VideoRequest(BaseModel):
 
 def valid_tiktok_url(value):
     try:
-        parsed = urlparse(value)
-        host = (parsed.hostname or "").lower()
+        p = urlparse(value)
+        host = (p.hostname or "").lower()
 
         return (
-            parsed.scheme == "https"
+            p.scheme == "https"
             and (
                 host == "tiktok.com"
                 or host.endswith(".tiktok.com")
             )
-            and not parsed.username
-            and not parsed.password
+            and not p.username
+            and not p.password
         )
     except (ValueError, TypeError):
         return False
@@ -54,13 +56,13 @@ def safe_media_url(value):
         return None
 
     try:
-        parsed = urlparse(value)
+        p = urlparse(value)
 
         if (
-            parsed.scheme == "https"
-            and parsed.hostname
-            and not parsed.username
-            and not parsed.password
+            p.scheme == "https"
+            and p.hostname
+            and not p.username
+            and not p.password
         ):
             return value
 
@@ -77,12 +79,14 @@ def first_url(value):
     if isinstance(value, list):
         for item in value:
             found = first_url(item)
+
             if found:
                 return found
 
     if isinstance(value, dict):
         for key in ("url_list", "url", "uri"):
             found = first_url(value.get(key))
+
             if found:
                 return found
 
@@ -123,18 +127,18 @@ def extract_media(story):
 
     images = []
 
-    for image in image_sources:
-        if isinstance(image, dict):
+    for item in image_sources:
+        if isinstance(item, dict):
             url = (
-                first_url(image.get("display_image"))
+                first_url(item.get("display_image"))
                 or first_url(
-                    image.get("owner_watermark_image")
+                    item.get("owner_watermark_image")
                 )
-                or first_url(image.get("url_list"))
-                or first_url(image.get("url"))
+                or first_url(item.get("url_list"))
+                or first_url(item.get("url"))
             )
         else:
-            url = first_url(image)
+            url = first_url(item)
 
         if url and url not in images:
             images.append(url)
@@ -154,7 +158,8 @@ def clean_username(value):
 
     if "tiktok.com/@" in value:
         value = value.split("tiktok.com/@", 1)[1]
-        value = value.split("?", 1)[0].split("/", 1)[0]
+        value = value.split("?", 1)[0]
+        value = value.split("/", 1)[0]
 
     value = value.lstrip("@")
 
@@ -226,7 +231,7 @@ def extract_ssstik_links(html):
     )
 
     for element in soup.select(selector):
-        href = ""
+        raw = ""
 
         for attribute in (
             "href",
@@ -237,26 +242,32 @@ def extract_ssstik_links(html):
             value = element.get(attribute)
 
             if isinstance(value, str) and value.strip():
-                href = value.strip()
+                raw = value.strip()
                 break
 
-        if not href:
+        if not raw:
             continue
 
-        href = urljoin(SSSTIK_HOME, href)
-        href = safe_media_url(href)
+        url = safe_media_url(
+            urljoin(SSSTIK_HOME, raw)
+        )
 
-        if not href or href in seen:
+        if not url or url in seen:
             continue
 
-        label = element.get_text(" ", strip=True)
-        title = element.get("title", "")
-        aria = element.get("aria-label", "")
+        label = (
+            element.get_text(" ", strip=True)
+            or str(
+                element.get("aria-label")
+                or element.get("title")
+                or "Baixar vídeo"
+            )
+        )
 
         description = " ".join([
             label,
-            str(title),
-            str(aria),
+            str(element.get("title", "")),
+            str(element.get("aria-label", "")),
             str(element.get("class", "")),
         ]).lower()
 
@@ -274,80 +285,31 @@ def extract_ssstik_links(html):
         )
 
         if not any(
-            keyword in description
-            for keyword in keywords
+            word in description
+            for word in keywords
         ):
             continue
 
-        if href.startswith(SSSTIK_HOME):
-            parsed = urlparse(href)
+        parsed = urlparse(url)
 
-            if parsed.path in (
+        if (
+            parsed.hostname == "ssstik.io"
+            and parsed.path in (
                 "/",
                 "/abc",
                 "/download"
-            ):
-                continue
-
-        seen.add(href)
-
-        if not label:
-            label = (
-                str(aria)
-                or str(title)
-                or "Baixar vídeo"
             )
+        ):
+            continue
+
+        seen.add(url)
 
         links.append({
-            "url": href,
+            "url": url,
             "label": label
         })
 
-    def priority(item):
-        label = item["label"].lower()
-
-        if re.search(
-            r"\bhd\b|1080p|high quality",
-            label
-        ):
-            return 0
-
-        if any(
-            word in label
-            for word in (
-                "sem marca",
-                "without watermark",
-                "no watermark"
-            )
-        ):
-            return 1
-
-        if any(
-            word in label
-            for word in (
-                "mp3",
-                "audio",
-                "áudio"
-            )
-        ):
-            return 3
-
-        return 2
-
-    links.sort(key=priority)
-
     return links
-
-
-@app.get("/")
-def home():
-    return {
-        "status": "online",
-        "service": "TikSave HD",
-        "version": "2.8",
-        "download_source": "yt-dlp / SSSTik",
-        "diagnostic_enabled": True
-    }
 
 
 async def try_ssstik(client, video_url):
@@ -375,18 +337,12 @@ async def try_ssstik(client, video_url):
 
     response.raise_for_status()
 
-    return extract_ssstik_links(response.text)
+    return extract_ssstik_links(
+        response.text
+    )
 
 
-def extract_best_with_ytdlp(
-    video_url,
-    browser_mode=False
-):
-    """
-    Consulta os formatos disponíveis.
-    Não baixa o vídeo no servidor.
-    """
-
+def extract_ytdlp_formats(video_url):
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -398,12 +354,6 @@ def extract_best_with_ytdlp(
         "cachedir": False,
     }
 
-    if browser_mode:
-        # Requer curl_cffi.
-        # Pode ajudar com diferenças de HTTP,
-        # mas não garante acesso ao TikTok.
-        opts["impersonate"] = "chrome"
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(
             video_url,
@@ -411,23 +361,29 @@ def extract_best_with_ytdlp(
         )
 
     if not isinstance(info, dict):
-        return None
+        return []
 
-    candidates = []
+    formats = info.get("formats") or [info]
 
-    for fmt in info.get("formats") or []:
-        if not isinstance(fmt, dict):
-            continue
+    output = []
 
-        url = safe_media_url(fmt.get("url"))
+    for fmt in formats:
+        url = safe_media_url(
+            fmt.get("url")
+        )
 
         if not url:
             continue
 
-        if fmt.get("vcodec") in (None, "none"):
+        if fmt.get("vcodec") in (
+            "none",
+            None
+        ):
             continue
 
-        if fmt.get("acodec") in (None, "none"):
+        # O download direto precisa conter
+        # vídeo e áudio no mesmo arquivo.
+        if fmt.get("acodec") == "none":
             continue
 
         if fmt.get("protocol") not in (
@@ -437,45 +393,103 @@ def extract_best_with_ytdlp(
         ):
             continue
 
-        candidates.append((
-            int(fmt.get("height") or 0),
-            float(fmt.get("tbr") or 0),
-            url
-        ))
+        output.append({
+            "url": url,
+            "width": int(
+                fmt.get("width") or 0
+            ),
+            "height": int(
+                fmt.get("height") or 0
+            ),
+            "bitrate_kbps": float(
+                fmt.get("tbr") or 0
+            ),
+            "source": "yt-dlp"
+        })
 
-    if candidates:
-        height, _, url = max(
-            candidates,
-            key=lambda item: (
-                item[0],
-                item[1]
-            )
+    return output
+
+
+def probe_media(url):
+    """
+    Tenta identificar a resolução
+    real de um arquivo de vídeo.
+
+    Esta função deve ser usada apenas
+    com URLs de mídia confiáveis.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                (
+                    "stream=codec_type,width,height,"
+                    "bit_rate:format=bit_rate"
+                ),
+                "-of",
+                "json",
+                url
+            ],
+            capture_output=True,
+            text=True,
+            timeout=9,
+            check=False,
+        )
+
+        if result.returncode:
+            return {}
+
+        payload = json.loads(
+            result.stdout
+        )
+
+        video = next(
+            (
+                stream
+                for stream in payload.get(
+                    "streams",
+                    []
+                )
+                if stream.get("codec_type")
+                == "video"
+            ),
+            {}
+        )
+
+        bitrate = (
+            video.get("bit_rate")
+            or payload.get(
+                "format",
+                {}
+            ).get("bit_rate")
+            or 0
         )
 
         return {
-            "url": url,
-            "height": height
-        }
-
-    direct = safe_media_url(info.get("url"))
-
-    if direct:
-        return {
-            "url": direct,
+            "width": int(
+                video.get("width") or 0
+            ),
             "height": int(
-                info.get("height") or 0
+                video.get("height") or 0
+            ),
+            "bitrate_kbps": round(
+                int(bitrate) / 1000
             )
         }
 
-    return None
+    except (
+        OSError,
+        ValueError,
+        subprocess.TimeoutExpired
+    ):
+        return {}
 
 
 def classify_ytdlp_error(exc):
-    """
-    Classifica erros sem expor
-    links internos na resposta JSON.
-    """
-
     message = str(exc).lower()
 
     if (
@@ -485,30 +499,31 @@ def classify_ytdlp_error(exc):
         return "resposta_inesperada_tiktok"
 
     if (
-        "impersonat" in message
-        or "curl_cffi" in message
-    ):
-        return "impersonacao_indisponivel"
-
-    if (
-        "http error 403" in message
+        "403" in message
         or "forbidden" in message
     ):
         return "http_403"
 
     if (
-        "http error 429" in message
+        "429" in message
         or "too many requests" in message
     ):
         return "http_429"
 
-    if (
-        "login" in message
-        or "sign in" in message
-    ):
-        return "acesso_restrito"
+    return (
+        "erro_" + type(exc).__name__
+    )
 
-    return f"erro_{type(exc).__name__}"
+
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "TikSave HD",
+        "version": "2.9",
+        "download_source": "yt-dlp / SSSTik",
+        "diagnostic_enabled": True
+    }
 
 
 @app.post("/api/download")
@@ -523,130 +538,220 @@ async def download_video(data: VideoRequest):
         )
 
     diagnostic = {
-        "yt_dlp_chrome": "nao_consultado",
         "yt_dlp_padrao": "nao_consultado",
-        "ssstik": "nao_consultado",
+        "ssstik": "nao_consultado"
     }
 
-    modes = (
-        (True, "yt_dlp_chrome"),
-        (False, "yt_dlp_padrao")
-    )
+    candidates = []
 
-    for mode, key in modes:
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    extract_best_with_ytdlp,
-                    data.url,
-                    mode
-                ),
-                timeout=30
-            )
+    # Primeiro: consulta o yt-dlp.
+    try:
+        candidates = await asyncio.wait_for(
+            asyncio.to_thread(
+                extract_ytdlp_formats,
+                data.url
+            ),
+            timeout=30
+        )
 
-            if result:
-                height = result["height"]
+        diagnostic["yt_dlp_padrao"] = (
+            f"{len(candidates)}_formatos_encontrados"
+        )
 
-                diagnostic[key] = (
-                    f"video_encontrado_"
-                    f"{height or 'resolucao_desconhecida'}"
-                )
+    except asyncio.TimeoutError:
+        diagnostic["yt_dlp_padrao"] = (
+            "tempo_esgotado"
+        )
 
-                if height:
-                    label = f"Baixar vídeo {height}p"
-                else:
-                    label = "Baixar vídeo"
+    except Exception as exc:
+        diagnostic["yt_dlp_padrao"] = (
+            classify_ytdlp_error(exc)
+        )
 
-                return {
-                    "status": "ok",
-                    "source": "yt-dlp",
-                    "hd_available": height >= 720,
-                    "links": [{
-                        "url": result["url"],
-                        "label": label
-                    }],
-                    "diagnostic": diagnostic
-                }
-
-            diagnostic[key] = "sem_link_compativel"
-
-        except asyncio.TimeoutError:
-            diagnostic[key] = "tempo_esgotado"
-
-        except Exception as exc:
-            diagnostic[key] = (
-                classify_ytdlp_error(exc)
-            )
-
+    # Segundo: consulta o SSSTik mesmo
+    # quando o yt-dlp encontra um vídeo.
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/130.0.0.0 Safari/537.36"
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "Chrome/130.0.0.0 "
+            "Safari/537.36"
         ),
         "Accept-Language": (
             "pt-BR,pt;q=0.9,en;q=0.8"
         ),
     }
 
-    async with httpx.AsyncClient(
-        timeout=30,
-        follow_redirects=True,
-        headers=headers
-    ) as client:
+    try:
+        async with httpx.AsyncClient(
+            timeout=25,
+            follow_redirects=True,
+            headers=headers
+        ) as client:
 
-        try:
-            links = await try_ssstik(
+            ssstik_links = await try_ssstik(
                 client,
                 data.url
             )
 
-            has_hd = any(
-                re.search(
-                    r"\bhd\b|1080p|high quality",
-                    item["label"],
-                    re.I
+        diagnostic["ssstik"] = (
+            f"{len(ssstik_links)}_links_encontrados"
+        )
+
+        for link in ssstik_links:
+            label = link["label"].lower()
+
+            if any(
+                word in label
+                for word in (
+                    "mp3",
+                    "audio",
+                    "áudio"
                 )
-                for item in links
+            ):
+                continue
+
+            candidates.append({
+                "url": link["url"],
+                "source": "ssstik",
+                "label": link["label"],
+                "width": 0,
+                "height": 0,
+                "bitrate_kbps": 0
+            })
+
+    except httpx.HTTPStatusError as exc:
+        diagnostic["ssstik"] = (
+            f"http_{exc.response.status_code}"
+        )
+
+    except httpx.HTTPError as exc:
+        diagnostic["ssstik"] = (
+            "erro_" + type(exc).__name__
+        )
+
+    if not candidates:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "Nenhum provedor retornou links."
+                ),
+                "diagnostic": diagnostic
+            }
+        )
+
+    # Consulta metadados de até três
+    # links retornados pelo SSSTik.
+    ssstik_to_probe = [
+        item
+        for item in candidates
+        if item["source"] == "ssstik"
+    ][:3]
+
+    probes = await asyncio.gather(
+        *(
+            asyncio.to_thread(
+                probe_media,
+                item["url"]
             )
-
-            diagnostic["ssstik"] = (
-                f"{len(links)}_links_encontrados"
-            )
-
-            if links:
-                return {
-                    "status": "ok",
-                    "source": "ssstik",
-                    "hd_available": bool(has_hd),
-                    "links": links,
-                    "diagnostic": diagnostic
-                }
-
-        except httpx.HTTPStatusError as exc:
-            diagnostic["ssstik"] = (
-                f"http_{exc.response.status_code}"
-            )
-
-        except httpx.RequestError as exc:
-            diagnostic["ssstik"] = (
-                f"erro_conexao_{type(exc).__name__}"
-            )
-
-        except (ValueError, TypeError) as exc:
-            diagnostic["ssstik"] = (
-                f"erro_resposta_{type(exc).__name__}"
-            )
-
-    raise HTTPException(
-        status_code=502,
-        detail={
-            "message": (
-                "Nenhum provedor retornou links."
-            ),
-            "diagnostic": diagnostic
-        }
+            for item in ssstik_to_probe
+        )
     )
+
+    for candidate, metadata in zip(
+        ssstik_to_probe,
+        probes
+    ):
+        candidate.update({
+            key: value
+            for key, value in metadata.items()
+            if value
+        })
+
+    # Remove links duplicados.
+    unique = {}
+
+    for candidate in candidates:
+        unique[candidate["url"]] = candidate
+
+    candidates = list(
+        unique.values()
+    )
+
+    # Ordena por resolução e bitrate
+    # quando essas informações existem.
+    candidates.sort(
+        key=lambda item: (
+            bool(item["height"]),
+            item["width"] * item["height"],
+            item["bitrate_kbps"]
+        ),
+        reverse=True
+    )
+
+    links = []
+
+    for item in candidates[:12]:
+        width = item["width"]
+        height = item["height"]
+
+        if width and height:
+            quality = f"{width}x{height}"
+
+        elif height:
+            quality = (
+                f"altura {height}px"
+            )
+
+        else:
+            quality = "não verificada"
+
+        label = (
+            f"{item['source']} • {quality}"
+        )
+
+        links.append({
+            "url": item["url"],
+            "label": label,
+            "source": item["source"],
+            "width": width or None,
+            "height": height or None,
+            "bitrate_kbps": (
+                item["bitrate_kbps"]
+                or None
+            ),
+            "quality_verified": bool(
+                width and height
+            )
+        })
+
+    sources = {
+        item["source"]
+        for item in candidates
+    }
+
+    return {
+        "status": "ok",
+        "source": (
+            "multiple"
+            if len(sources) > 1
+            else candidates[0]["source"]
+        ),
+        "hd_available": any(
+            item["width"] >= 720
+            and item["height"] >= 720
+            for item in candidates
+        ),
+        "links": links,
+        "diagnostic": diagnostic,
+        "note": (
+            "Qualidade não verificada não "
+            "significa qualidade baixa. "
+            "Links podem expirar."
+        )
+    }
 
 
 @app.get("/api/highlights")
@@ -687,28 +792,17 @@ async def get_highlights(
         "GET"
     ).strip().upper()
 
-    if not api_url:
+    if (
+        not api_url
+        or not api_url.startswith("https://")
+        or method not in ("GET", "POST")
+    ):
         raise HTTPException(
             status_code=503,
             detail=(
-                "A fonte de Destaques "
-                "não está configurada."
+                "Fonte de Destaques "
+                "não configurada corretamente."
             )
-        )
-
-    if not api_url.startswith("https://"):
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "A fonte de Destaques "
-                "precisa usar HTTPS."
-            )
-        )
-
-    if method not in ("GET", "POST"):
-        raise HTTPException(
-            status_code=503,
-            detail="Método de Destaques inválido."
         )
 
     cache_key = (
@@ -764,8 +858,10 @@ async def get_highlights(
                 }
 
                 if collection:
-                    params["collection"] = collection
-                    params["cursor"] = cursor
+                    params.update({
+                        "collection": collection,
+                        "cursor": cursor
+                    })
 
                 response = await client.get(
                     api_url,
@@ -776,28 +872,30 @@ async def get_highlights(
                 )
 
             if response.status_code == 429:
-                wait_seconds = RATE_LIMIT_WAIT
-
                 retry_after = response.headers.get(
                     "Retry-After",
                     ""
                 )
 
-                if retry_after.isdigit():
-                    wait_seconds = max(
-                        wait_seconds,
-                        int(retry_after)
-                    )
+                wait_seconds = (
+                    int(retry_after)
+                    if retry_after.isdigit()
+                    else RATE_LIMIT_WAIT
+                )
 
                 rate_limit_until = (
-                    time.monotonic() + wait_seconds
+                    time.monotonic()
+                    + max(
+                        RATE_LIMIT_WAIT,
+                        wait_seconds
+                    )
                 )
 
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "Limite de consultas do provedor "
-                        "atingido. Tente mais tarde."
+                        "Limite de consultas "
+                        "do provedor atingido."
                     )
                 )
 
@@ -807,13 +905,18 @@ async def get_highlights(
         if collection:
             result = normalize_items(payload)
 
-            result["username"] = username
-            result["collection"] = collection
+            result.update({
+                "username": username,
+                "collection": collection
+            })
 
             ttl = ITEMS_TTL
 
         else:
-            result = normalize_collections(payload)
+            result = normalize_collections(
+                payload
+            )
+
             ttl = COLLECTIONS_TTL
 
         cache_set(
@@ -849,6 +952,7 @@ async def get_highlights(
         raise HTTPException(
             status_code=502,
             detail=(
-                "A fonte retornou dados inválidos."
+                "A fonte retornou "
+                "dados inválidos."
             )
         )
