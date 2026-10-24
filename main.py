@@ -16,11 +16,13 @@ from highlights_adapter import (
 
 app = FastAPI(
     title="TikSave HD API",
-    version="2.4"
+    version="2.5"
 )
 
 SSSTIK_HOME = "https://ssstik.io/"
 SSSTIK_ENDPOINT = "https://ssstik.io/abc?url=dl"
+TIKDOWNLOADER_HOME = "https://tikdownloader.io/"
+TIKDOWNLOADER_ENDPOINT = "https://tikdownloader.io/api/ajaxSearch"
 
 COLLECTIONS_TTL = 86400
 ITEMS_TTL = 1800
@@ -343,9 +345,137 @@ def home():
     return {
         "status": "online",
         "service": "TikSave HD",
-        "version": "2.4",
-        "download_source": "SSSTik"
+        "version": "2.5",
+        "download_source": "TikDownloader / SSSTik"
     }
+
+
+def extract_tikdownloader_links(html):
+    """Extract explicit download anchors; never label a regular video as HD."""
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    seen = set()
+
+    for anchor in soup.select("a[href], a[data-href]"):
+        raw = anchor.get("href") or anchor.get("data-href")
+
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+
+        href = safe_media_url(
+            urljoin(TIKDOWNLOADER_HOME, raw.strip())
+        )
+
+        if not href or href in seen:
+            continue
+
+        label = " ".join(filter(None, [
+            anchor.get_text(" ", strip=True),
+            str(anchor.get("title", "")),
+            str(anchor.get("aria-label", "")),
+        ])).strip()
+
+        lowered = label.lower()
+
+        if not any(word in lowered for word in (
+            "download", "baixar", "mp4",
+            "hd", "1080", "watermark", "marca"
+        )):
+            continue
+
+        if any(word in lowered for word in (
+            "mp3", "audio", "áudio"
+        )):
+            continue
+
+        if (
+            urlparse(href).hostname == "tikdownloader.io"
+            and urlparse(href).path in ("/", "/pt")
+        ):
+            continue
+
+        seen.add(href)
+
+        links.append({
+            "url": href,
+            "label": label or "Baixar vídeo"
+        })
+
+    links.sort(
+        key=lambda item: not bool(
+            re.search(
+                r"\bhd\b|1080p|full\s*hd",
+                item["label"],
+                re.I
+            )
+        )
+    )
+
+    return links
+
+
+async def try_tikdownloader(client, video_url):
+    # O endpoint pode mudar ou bloquear requisições do Render.
+    response = await client.post(
+        TIKDOWNLOADER_ENDPOINT,
+        data={
+            "q": video_url,
+            "lang": "pt"
+        },
+        headers={
+            "Origin": "https://tikdownloader.io",
+            "Referer": "https://tikdownloader.io/pt",
+            "Accept": "application/json, text/html, */*",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+
+    response.raise_for_status()
+
+    html = response.text
+
+    try:
+        payload = response.json()
+
+        if isinstance(payload, dict):
+            html = str(
+                payload.get("data")
+                or payload.get("html")
+                or ""
+            )
+
+    except ValueError:
+        pass
+
+    return extract_tikdownloader_links(html)
+
+
+async def try_ssstik(client, video_url):
+    page = await client.get(SSSTIK_HOME)
+    page.raise_for_status()
+
+    token = extract_ssstik_token(page.text)
+
+    response = await client.post(
+        SSSTIK_ENDPOINT,
+        data={
+            "id": video_url,
+            "locale": "pt",
+            "tt": token
+        },
+        headers={
+            "Accept": "text/html, */*",
+            "HX-Request": "true",
+            "HX-Target": "target",
+            "HX-Trigger": "_gcaptcha_pt",
+            "Origin": "https://ssstik.io",
+            "Referer": SSSTIK_HOME,
+        },
+    )
+
+    response.raise_for_status()
+
+    return extract_ssstik_links(response.text)
 
 
 @app.post("/api/download")
@@ -356,98 +486,65 @@ async def download_video(data: VideoRequest):
             detail="Insira um link HTTPS válido do TikTok."
         )
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=30,
-            follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) "
-                    "Chrome/130.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": (
-                    "pt-BR,pt;q=0.9,en;q=0.8"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=30,
+        follow_redirects=True,
+        headers=headers
+    ) as client:
+
+        for source, fetch in (
+            ("tikdownloader", try_tikdownloader),
+            ("ssstik", try_ssstik),
+        ):
+            try:
+                links = await fetch(client, data.url)
+
+            except (
+                httpx.HTTPError,
+                ValueError,
+                TypeError
+            ):
+                continue
+
+            if not links:
+                continue
+
+            has_hd = any(
+                re.search(
+                    r"\bhd\b|1080p|full\s*hd",
+                    link["label"],
+                    re.I
                 )
+                for link in links
+            )
+
+            # Prioriza HD verdadeiro; usa SSSTik como reserva.
+            if source == "tikdownloader" and not has_hd:
+                continue
+
+            return {
+                "status": "ok",
+                "source": source,
+                "hd_available": bool(has_hd),
+                "links": links,
             }
-        ) as client:
 
-            page = await client.get(
-                SSSTIK_HOME
-            )
-            page.raise_for_status()
-
-            token = extract_ssstik_token(
-                page.text
-            )
-
-            response = await client.post(
-                SSSTIK_ENDPOINT,
-                data={
-                    "id": data.url,
-                    "locale": "pt",
-                    "tt": token
-                },
-                headers={
-                    "Accept": "text/html, */*",
-                    "HX-Request": "true",
-                    "HX-Target": "target",
-                    "HX-Trigger": "_gcaptcha_pt",
-                    "Origin": "https://ssstik.io",
-                    "Referer": SSSTIK_HOME
-                }
-            )
-
-            response.raise_for_status()
-
-        links = extract_ssstik_links(
-            response.text
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "Nenhum provedor retornou "
+            "links de vídeo reconhecidos."
         )
-
-        if not links:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "O SSSTik não retornou "
-                    "links de download reconhecidos."
-                )
-            )
-
-        has_hd = any(
-            re.search(
-                r"\bhd\b|1080p|high quality",
-                item["label"],
-                re.IGNORECASE
-            )
-            for item in links
-        )
-
-        return {
-            "status": "ok",
-            "source": "ssstik",
-            "hd_available": bool(has_hd),
-            "links": links
-        }
-
-    except HTTPException:
-        raise
-
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "O SSSTik retornou HTTP "
-                f"{exc.response.status_code}."
-            )
-        )
-
-    except httpx.HTTPError:
-        raise HTTPException(
-            status_code=502,
-            detail="Serviço SSSTik indisponível."
-        )
+    )
 
 
 @app.get("/api/highlights")
