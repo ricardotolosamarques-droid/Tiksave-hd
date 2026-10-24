@@ -166,6 +166,40 @@ def _make_token(url, headers):
     return token
 
 
+
+async def _ssstik_fallback(video_url):
+    """Optional direct-link fallback when TikTok CDN proxy returns 403."""
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            response = await client.post(
+                "https://ssstik.io/abc",
+                data={"id": video_url, "locale": "pt", "tt": ""},
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            )
+            response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        found = []
+        for a in soup.select("a[href]"):
+            href = safe_media_url(a.get("href"))
+            if not href:
+                continue
+            host = (urlparse(href).hostname or "").lower()
+            # Never expose arbitrary HTML links as video downloads.
+            if not (host == "tikcdn.io" or host.endswith(".tikcdn.io")
+                    or _allowed_cdn(href)):
+                continue
+            label = a.get_text(" ", strip=True) or "Baixar vídeo"
+            if re.search(r"mp3|audio|áudio|music", label, re.I):
+                continue
+            if href not in [item["url"] for item in found]:
+                found.append({"url": href, "label": label,
+                              "source": "ssstik", "quality_verified": False})
+            if len(found) >= 4:
+                break
+        return found
+    except (httpx.HTTPError, ValueError):
+        return []
+
 @app.get("/")
 def health():
     return {"status": "online", "service": "TikSave HD", "version": "3.2.2"}
@@ -212,6 +246,10 @@ async def download_video(data: VideoRequest):
         })
         if len(links) >= 12:
             break
+    # Direct links avoid Render proxy bandwidth and the CDN 403 seen in logs.
+    direct_links = await _ssstik_fallback(data.url)
+    diagnostic["ssstik"] = f"{len(direct_links)}_links"
+    links = direct_links + links
     if not links:
         raise HTTPException(status_code=502, detail={
             "message": "yt-dlp não encontrou links de vídeo disponíveis.",
