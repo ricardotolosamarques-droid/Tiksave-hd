@@ -2,9 +2,11 @@
 import os
 import re
 import time
+import asyncio
 from urllib.parse import urlparse, urljoin
 
 import httpx
+import yt_dlp
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -16,7 +18,7 @@ from highlights_adapter import (
 
 app = FastAPI(
     title="TikSave HD API",
-    version="2.6"
+    version="2.7"
 )
 
 SSSTIK_HOME = "https://ssstik.io/"
@@ -340,76 +342,53 @@ def extract_ssstik_links(html):
     return links
 
 
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "TikSave HD",
+        "version": "2.7",
+        "download_source": "yt-dlp / SSSTik"
+    }
+
+
 def extract_tikdownloader_links(html):
+    """Extract explicit download anchors; never label a regular video as HD."""
     soup = BeautifulSoup(html, "html.parser")
     links = []
     seen = set()
-
     for anchor in soup.select("a[href], a[data-href]"):
         raw = anchor.get("href") or anchor.get("data-href")
-
         if not isinstance(raw, str) or not raw.strip():
             continue
-
-        href = safe_media_url(
-            urljoin(TIKDOWNLOADER_HOME, raw.strip())
-        )
-
+        href = safe_media_url(urljoin(TIKDOWNLOADER_HOME, raw.strip()))
         if not href or href in seen:
             continue
-
         label = " ".join(filter(None, [
             anchor.get_text(" ", strip=True),
             str(anchor.get("title", "")),
             str(anchor.get("aria-label", "")),
         ])).strip()
-
         lowered = label.lower()
-
         if not any(word in lowered for word in (
-            "download", "baixar", "mp4",
-            "hd", "1080", "watermark", "marca"
+            "download", "baixar", "mp4", "hd", "1080", "watermark", "marca"
         )):
             continue
-
-        if any(word in lowered for word in (
-            "mp3", "audio", "áudio"
-        )):
+        if any(word in lowered for word in ("mp3", "audio", "áudio")):
             continue
-
-        if (
-            urlparse(href).hostname == "tikdownloader.io"
-            and urlparse(href).path in ("/", "/pt")
-        ):
+        if urlparse(href).hostname == "tikdownloader.io" and urlparse(href).path in ("/", "/pt"):
             continue
-
         seen.add(href)
-
-        links.append({
-            "url": href,
-            "label": label or "Baixar vídeo"
-        })
-
-    links.sort(
-        key=lambda item: not bool(
-            re.search(
-                r"\bhd\b|1080p|full\s*hd",
-                item["label"],
-                re.I
-            )
-        )
-    )
-
+        links.append({"url": href, "label": label or "Baixar vídeo"})
+    links.sort(key=lambda item: not bool(re.search(r"\bhd\b|1080p|full\s*hd", item["label"], re.I)))
     return links
 
 
 async def try_tikdownloader(client, video_url):
+    # This public website endpoint may change or block datacenter requests.
     response = await client.post(
         TIKDOWNLOADER_ENDPOINT,
-        data={
-            "q": video_url,
-            "lang": "pt"
-        },
+        data={"q": video_url, "lang": "pt"},
         headers={
             "Origin": "https://tikdownloader.io",
             "Referer": "https://tikdownloader.io/pt",
@@ -417,40 +396,24 @@ async def try_tikdownloader(client, video_url):
             "X-Requested-With": "XMLHttpRequest",
         },
     )
-
     response.raise_for_status()
-
     html = response.text
-
     try:
         payload = response.json()
-
         if isinstance(payload, dict):
-            html = str(
-                payload.get("data")
-                or payload.get("html")
-                or ""
-            )
-
+            html = str(payload.get("data") or payload.get("html") or "")
     except ValueError:
         pass
-
     return extract_tikdownloader_links(html)
 
 
 async def try_ssstik(client, video_url):
     page = await client.get(SSSTIK_HOME)
     page.raise_for_status()
-
     token = extract_ssstik_token(page.text)
-
     response = await client.post(
         SSSTIK_ENDPOINT,
-        data={
-            "id": video_url,
-            "locale": "pt",
-            "tt": token
-        },
+        data={"id": video_url, "locale": "pt", "tt": token},
         headers={
             "Accept": "text/html, */*",
             "HX-Request": "true",
@@ -460,21 +423,57 @@ async def try_ssstik(client, video_url):
             "Referer": SSSTIK_HOME,
         },
     )
-
     response.raise_for_status()
-
     return extract_ssstik_links(response.text)
 
 
-@app.get("/")
-def home():
-    return {
-        "status": "online",
-        "service": "TikSave HD",
-        "version": "2.6",
-        "download_source": "TikDownloader / SSSTik",
-        "diagnostic_enabled": True
+def extract_best_with_ytdlp(video_url):
+    """Retorna a melhor URL progressiva de vídeo+áudio, quando disponível."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "socket_timeout": 15,
+        "retries": 1,
+        "extractor_retries": 1,
+        "cachedir": False,
     }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+
+    if not isinstance(info, dict):
+        return None
+
+    candidates = []
+    for fmt in info.get("formats") or []:
+        if not isinstance(fmt, dict):
+            continue
+        url = safe_media_url(fmt.get("url"))
+        if not url:
+            continue
+        if fmt.get("vcodec") in (None, "none"):
+            continue
+        # Link único com vídeo e áudio: não requer ffmpeg no Render.
+        if fmt.get("acodec") in (None, "none"):
+            continue
+        if fmt.get("protocol") not in (None, "https", "http"):
+            continue
+        candidates.append((
+            int(fmt.get("height") or 0),
+            float(fmt.get("tbr") or 0),
+            url,
+        ))
+
+    if not candidates:
+        # Alguns extratores só retornam uma URL final, sem formatos.
+        direct = safe_media_url(info.get("url"))
+        if not direct:
+            return None
+        return {"url": direct, "height": int(info.get("height") or 0)}
+
+    height, _, url = max(candidates, key=lambda item: (item[0], item[1]))
+    return {"url": url, "height": height}
 
 
 @app.post("/api/download")
@@ -485,6 +484,38 @@ async def download_video(data: VideoRequest):
             detail="Insira um link HTTPS válido do TikTok."
         )
 
+    diagnostic = {
+        "yt_dlp": "nao_consultado",
+        "ssstik": "nao_consultado",
+    }
+
+    try:
+        # yt-dlp é síncrono: executar fora do loop do FastAPI.
+        result = await asyncio.wait_for(
+            asyncio.to_thread(extract_best_with_ytdlp, data.url),
+            timeout=35,
+        )
+        if result:
+            height = result["height"]
+            diagnostic["yt_dlp"] = f"video_encontrado_{height or 'resolucao_desconhecida'}"
+            return {
+                "status": "ok",
+                "source": "yt-dlp",
+                # HD só é afirmado quando a resolução informada >= 720p.
+                "hd_available": height >= 720,
+                "links": [{
+                    "url": result["url"],
+                    "label": f"Baixar vídeo {height}p" if height else "Baixar vídeo",
+                }],
+                "diagnostic": diagnostic,
+            }
+        diagnostic["yt_dlp"] = "sem_link_compativel"
+    except asyncio.TimeoutError:
+        diagnostic["yt_dlp"] = "tempo_esgotado"
+    except Exception as exc:
+        # Não devolver a mensagem completa: pode conter URLs e dados sensíveis.
+        diagnostic["yt_dlp"] = f"erro_{type(exc).__name__}"
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -493,109 +524,37 @@ async def download_video(data: VideoRequest):
         ),
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
     }
-
-    diagnostic = {
-        "tikdownloader": "nao_consultado",
-        "ssstik": "nao_consultado"
-    }
-
     async with httpx.AsyncClient(
-        timeout=30,
-        follow_redirects=True,
-        headers=headers
+        timeout=30, follow_redirects=True, headers=headers
     ) as client:
-
         try:
-            links = await try_tikdownloader(
-                client, data.url
-            )
-
+            links = await try_ssstik(client, data.url)
             has_hd = any(
-                re.search(
-                    r"\bhd\b|1080p|full\s*hd",
-                    item["label"],
-                    re.I
-                )
+                re.search(r"\bhd\b|1080p|high quality", item["label"], re.I)
                 for item in links
             )
-
-            diagnostic["tikdownloader"] = (
-                "hd_encontrado" if has_hd
-                else f"sem_hd_reconhecido_{len(links)}_links"
-            )
-
-            if has_hd:
-                return {
-                    "status": "ok",
-                    "source": "tikdownloader",
-                    "hd_available": True,
-                    "links": links,
-                    "diagnostic": diagnostic
-                }
-
-        except httpx.HTTPStatusError as exc:
-            diagnostic["tikdownloader"] = (
-                f"http_{exc.response.status_code}"
-            )
-
-        except httpx.RequestError as exc:
-            diagnostic["tikdownloader"] = (
-                f"erro_conexao_{type(exc).__name__}"
-            )
-
-        except (ValueError, TypeError) as exc:
-            diagnostic["tikdownloader"] = (
-                f"erro_resposta_{type(exc).__name__}"
-            )
-
-        try:
-            links = await try_ssstik(
-                client, data.url
-            )
-
-            has_hd = any(
-                re.search(
-                    r"\bhd\b|1080p|high quality",
-                    item["label"],
-                    re.I
-                )
-                for item in links
-            )
-
-            diagnostic["ssstik"] = (
-                f"{len(links)}_links_encontrados"
-            )
-
+            diagnostic["ssstik"] = f"{len(links)}_links_encontrados"
             if links:
                 return {
                     "status": "ok",
                     "source": "ssstik",
                     "hd_available": bool(has_hd),
                     "links": links,
-                    "diagnostic": diagnostic
+                    "diagnostic": diagnostic,
                 }
-
         except httpx.HTTPStatusError as exc:
-            diagnostic["ssstik"] = (
-                f"http_{exc.response.status_code}"
-            )
-
+            diagnostic["ssstik"] = f"http_{exc.response.status_code}"
         except httpx.RequestError as exc:
-            diagnostic["ssstik"] = (
-                f"erro_conexao_{type(exc).__name__}"
-            )
-
+            diagnostic["ssstik"] = f"erro_conexao_{type(exc).__name__}"
         except (ValueError, TypeError) as exc:
-            diagnostic["ssstik"] = (
-                f"erro_resposta_{type(exc).__name__}"
-            )
+            diagnostic["ssstik"] = f"erro_resposta_{type(exc).__name__}"
 
     raise HTTPException(
         status_code=502,
         detail={
             "message": "Nenhum provedor retornou links.",
-            "diagnostic": diagnostic
-        }
+            "diagnostic": diagnostic,
+        },
     )
 
 
