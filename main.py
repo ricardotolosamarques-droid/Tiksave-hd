@@ -168,7 +168,7 @@ def _make_token(url, headers):
 
 @app.get("/")
 def health():
-    return {"status": "online", "service": "TikSave HD", "version": "3.2.1"}
+    return {"status": "online", "service": "TikSave HD", "version": "3.2.2"}
 
 
 @app.post("/api/download")
@@ -232,66 +232,85 @@ async def download_file(token: str = Query(..., min_length=20)):
     url, _, saved_headers = record
     if not _allowed_cdn(url) or not await asyncio.to_thread(_public_dns, urlparse(url).hostname):
         raise HTTPException(status_code=403, detail="CDN não permitida.")
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10, read=30, write=10, pool=10),
-        follow_redirects=False, trust_env=False,
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "video/mp4,*/*", **saved_headers}
-    )
+    # curl_cffi usa fingerprint TLS de navegador, preservando headers do yt-dlp.
+    # A validação de domínio e DNS continua obrigatória a cada redirect.
+    from curl_cffi import requests as curl_requests
+
+    def _open_video():
+        session = curl_requests.Session(impersonate="chrome")
+        response = None
+        try:
+            current = url
+            headers = {"Accept": "video/mp4,*/*", **saved_headers}
+            for _ in range(4):
+                if not _allowed_cdn(current) or not _public_dns(urlparse(current).hostname):
+                    raise HTTPException(status_code=403, detail="CDN não permitida.")
+                response = session.get(
+                    current, headers=headers, stream=True,
+                    allow_redirects=False, timeout=30
+                )
+                if response.status_code not in (301, 302, 303, 307, 308):
+                    break
+                location = response.headers.get("location")
+                response.close()
+                response = None
+                if not location:
+                    raise HTTPException(status_code=502, detail="Redirecionamento inválido.")
+                current = urljoin(current, location)
+            else:
+                raise HTTPException(status_code=502, detail="Redirecionamentos excessivos.")
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"CDN retornou HTTP {response.status_code} (curl_cffi)."
+                )
+            content_type = response.headers.get("content-type", "").lower()
+            length = response.headers.get("content-length", "")
+            if not (content_type.startswith("video/") or
+                    content_type.startswith("application/octet-stream")):
+                raise HTTPException(status_code=502, detail="CDN não retornou um vídeo.")
+            if length.isdigit() and int(length) > MAX_FILE_BYTES:
+                raise HTTPException(status_code=413, detail="Vídeo excede limite de tamanho.")
+            return session, response
+        except Exception:
+            if response is not None:
+                response.close()
+            session.close()
+            raise
+
     try:
-        current = url
-        for _ in range(4):
-            response = await client.send(client.build_request("GET", current), stream=True)
-            if response.status_code not in (301, 302, 303, 307, 308):
-                break
-            location = response.headers.get("location")
-            await response.aclose()
-            if not location:
-                await client.aclose()
-                raise HTTPException(status_code=502, detail="Redirecionamento inválido.")
-            following = urljoin(current, location)
-            if not _allowed_cdn(following) or not await asyncio.to_thread(_public_dns, urlparse(following).hostname):
-                await client.aclose()
-                raise HTTPException(status_code=502, detail="Redirecionamento não permitido.")
-            current = following
-        else:
-            await client.aclose()
-            raise HTTPException(status_code=502, detail="Redirecionamentos excessivos.")
-        if response.status_code != 200:
-            status = response.status_code
-            await response.aclose()
-            await client.aclose()
-            raise HTTPException(status_code=502, detail=f"CDN retornou HTTP {status}.")
-        content_type = response.headers.get("content-type", "").lower()
-        length = response.headers.get("content-length", "")
-        if not (content_type.startswith("video/") or content_type.startswith("application/octet-stream")):
-            await response.aclose()
-            await client.aclose()
-            raise HTTPException(status_code=502, detail="CDN não retornou um vídeo.")
-        if length.isdigit() and int(length) > MAX_FILE_BYTES:
-            await response.aclose()
-            await client.aclose()
-            raise HTTPException(status_code=413, detail="Vídeo excede limite de tamanho.")
+        session, response = await asyncio.to_thread(_open_video)
     except HTTPException:
         raise
-    except httpx.HTTPError:
-        await client.aclose()
-        raise HTTPException(status_code=502, detail="Falha na conexão com a CDN.")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Falha na conexão com a CDN ({type(exc).__name__})."
+        )
+
+    def _read_next(iterator):
+        return next(iterator, None)
+
     async def stream():
         total = 0
+        iterator = response.iter_content(chunk_size=65536)
         try:
-            async for chunk in response.aiter_bytes(chunk_size=65536):
+            while True:
+                chunk = await asyncio.to_thread(_read_next, iterator)
+                if chunk is None:
+                    break
                 total += len(chunk)
                 if total > MAX_FILE_BYTES:
                     break
-                yield chunk
+                if chunk:
+                    yield chunk
         finally:
-            await response.aclose()
-            await client.aclose()
+            await asyncio.to_thread(response.close)
+            await asyncio.to_thread(session.close)
+
     return StreamingResponse(stream(), media_type="video/mp4", headers={
         "Content-Disposition": 'attachment; filename="tiksave-video.mp4"',
         "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"
     })
-
 
 @app.get("/api/highlights")
 async def highlights(username: str = Query(..., min_length=1),
