@@ -408,6 +408,37 @@ async def download_file(token: str = Query(..., min_length=20)):
         "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"
     })
 
+@app.post("/api/test/tikwm")
+async def test_tikwm(data: VideoRequest):
+    """Isolated TikWM probe; does not change existing download providers."""
+    if not valid_tiktok_url(data.url):
+        raise HTTPException(status_code=400, detail="URL do TikTok inválida.")
+    try:
+        async with httpx.AsyncClient(timeout=35, follow_redirects=False) as client:
+            response = await client.post(
+                "https://www.tikwm.com/api/",
+                data={"url": data.url, "hd": "1"},
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            return {"status": "error", "provider": "tikwm",
+                    "detail": str(payload.get("msg", "resposta_invalida"))[:150] if isinstance(payload, dict) else "resposta_invalida"}
+        video = payload.get("data")
+        if not isinstance(video, dict):
+            return {"status": "error", "provider": "tikwm", "detail": "sem_dados"}
+        links = []
+        for field, label in (("hdplay", "HD"), ("play", "Padrão")):
+            url = safe_media_url(video.get(field))
+            if url and url not in [item["url"] for item in links]:
+                links.append({"url": url, "label": label})
+        return {"status": "ok" if links else "error", "provider": "tikwm",
+                "links": links, "diagnostic": "links_obtidos_nao_verificados"}
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        return {"status": "error", "provider": "tikwm", "detail": type(exc).__name__}
+
+
 @app.get("/api/highlights")
 async def highlights(username: str = Query(..., min_length=1),
                      collection: str = Query(""), cursor: str = Query("0")):
