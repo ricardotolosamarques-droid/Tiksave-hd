@@ -236,9 +236,21 @@ async def download_video(data: VideoRequest):
             continue
         seen.add(key)
         width, height = fmt["width"], fmt["height"]
+        # Experimental direct CDN URL: the browser, not Render, requests the media.
+        # Keep the existing proxy as a separate fallback. URLs are short-lived and
+        # may require headers/cookies that browsers cannot supply.
+        links.append({
+            "url": fmt["url"],
+            "label": f"yt-dlp direto • {width}x{height}" if width and height else "yt-dlp direto • qualidade não verificada",
+            "source": "yt-dlp-direct", "width": width or None,
+            "height": height or None,
+            "bitrate_kbps": fmt["bitrate_kbps"] or None,
+            "quality_verified": bool(width and height),
+            "experimental": True,
+        })
         links.append({
             "url": "/api/file?token=" + token,
-            "label": f"yt-dlp • {width}x{height}" if width and height else "yt-dlp • qualidade não verificada",
+            "label": f"yt-dlp proxy • {width}x{height}" if width and height else "yt-dlp proxy • qualidade não verificada",
             "source": "yt-dlp", "width": width or None,
             "height": height or None,
             "bitrate_kbps": fmt["bitrate_kbps"] or None,
