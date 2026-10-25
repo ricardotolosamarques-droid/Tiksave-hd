@@ -79,7 +79,9 @@ def _site_extract_cobalt(url: str):
             json={"url": url, "videoQuality": "max", "filenameStyle": "basic"},
             headers=headers,
         )
-        response.raise_for_status()
+        if response.is_error:
+            print("Cobalt API HTTP", response.status_code, "response:", response.text[:650], flush=True)
+            raise ValueError(f"Cobalt recusou a solicitação (HTTP {response.status_code}).")
         payload = response.json()
     status = payload.get("status")
     candidates = []
@@ -497,7 +499,7 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
     except Exception as error:
         print(f"Telegram send failed: {type(error).__name__}: {str(error)[:250]}")
         try:
-            await _telegram_send(chat_id, "Não consegui enviar esse vídeo. Ele pode estar indisponível, ser uma publicação de fotos ou ultrapassar 45 MB.")
+            await _telegram_send(chat_id, ("O Cobalt recusou esse link ou não conseguiu acessar a publicação do Instagram. Não é necessariamente limite de 45 MB." if provider == "cobalt" and ("Cobalt recusou" in str(error) or "400 Bad Request" in str(error)) else "Não consegui enviar esse vídeo. A fonte pode estar indisponível, o formato pode não ser compatível ou o arquivo pode ultrapassar 45 MB."))
         except Exception:
             pass
 
