@@ -142,21 +142,26 @@ async def proxy_file(token: str):
     import ipaddress
     import socket
     from urllib.parse import urljoin
+
     entry = download_tokens.get(token)
     if not entry or entry[1] < time.time():
         raise HTTPException(status_code=404, detail="Link expirado. Faça nova busca.")
-    media_url = entry[0]
-    # Reject arbitrary/private network destinations even after redirects.
+
     def safe_url(value):
         parsed = urlparse(value)
         host = (parsed.hostname or "").lower()
         if parsed.scheme != "https" or not host or parsed.username or parsed.password:
             return False
-        allowed = ("tikwm.com", "tiktokcdn.com", "tiktokcdn-us.com",
-                   "byteoversea.com", "byteoversea.net", "ibytedtos.com",
-                   "tiktokv.com", "tiktok.com", "muscdn.com",
-                   "cobalt.tools", "cobalt-api.me", "cobaltcdn.com")
-        if not any(host == h or host.endswith("." + h) for h in allowed):
+        allowed = (
+            "tikwm.com", "tiktokcdn.com", "tiktokcdn-us.com",
+            "byteoversea.com", "byteoversea.net", "ibytedtos.com",
+            "tiktokv.com", "tiktok.com", "muscdn.com",
+            "cobalt.tools", "cobalt-api.me", "cobaltcdn.com",
+        )
+        cobalt_host = (urlparse(COBALT_API_URL).hostname or "").lower()
+        if cobalt_host:
+            allowed += (cobalt_host,)
+        if not any(host == domain or host.endswith("." + domain) for domain in allowed):
             return False
         try:
             addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
@@ -164,30 +169,62 @@ async def proxy_file(token: str):
         except OSError:
             return False
 
-    async def video_stream():
-        async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
-            current = media_url
-            for _ in range(5):
-                if not await asyncio.to_thread(safe_url, current):
-                    raise ValueError("Destino de mídia não permitido.")
-                async with client.stream("GET", current) as response:
-                    if response.status_code in (301, 302, 303, 307, 308):
-                        location = response.headers.get("location")
-                        if not location:
-                            raise ValueError("Redirecionamento inválido.")
-                        current = urljoin(current, location)
-                        continue
-                    response.raise_for_status()
-                    mime = response.headers.get("content-type", "").lower()
-                    if mime.startswith("audio/"):
-                        raise ValueError("A fonte retornou apenas áudio.")
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
-                    return
-            raise ValueError("Muitos redirecionamentos.")
+    # Validate the upstream BEFORE sending HTTP 200 to the browser.
+    # Previously exceptions inside StreamingResponse caused broken partial downloads.
+    client = httpx.AsyncClient(timeout=90, follow_redirects=False)
+    stream_context = None
+    response = None
+    current = entry[0]
+    try:
+        for _ in range(5):
+            if not await asyncio.to_thread(safe_url, current):
+                raise HTTPException(status_code=502, detail="Fonte retornou domínio de mídia não autorizado.")
+            stream_context = client.stream("GET", current, headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "video/mp4,application/octet-stream,*/*",
+            })
+            response = await stream_context.__aenter__()
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("location")
+                await stream_context.__aexit__(None, None, None)
+                stream_context = None
+                if not location:
+                    raise HTTPException(status_code=502, detail="Redirecionamento inválido.")
+                current = urljoin(current, location)
+                continue
+            if response.status_code >= 400:
+                print(f"Site proxy upstream failed: HTTP {response.status_code} host={urlparse(current).hostname}")
+                raise HTTPException(status_code=502, detail=f"Fonte recusou o vídeo (HTTP {response.status_code}).")
+            mime = response.headers.get("content-type", "").split(";")[0].lower()
+            if mime.startswith("audio/") or mime in ("text/html", "application/json"):
+                raise HTTPException(status_code=502, detail="Fonte não retornou arquivo de vídeo.")
+            break
+        else:
+            raise HTTPException(status_code=502, detail="Muitos redirecionamentos.")
+    except HTTPException:
+        if stream_context:
+            await stream_context.__aexit__(None, None, None)
+        await client.aclose()
+        raise
+    except (httpx.HTTPError, OSError) as exc:
+        if stream_context:
+            await stream_context.__aexit__(None, None, None)
+        await client.aclose()
+        print(f"Site proxy connection failed: {type(exc).__name__}: {str(exc)[:150]}")
+        raise HTTPException(status_code=502, detail="Falha ao conectar à fonte de vídeo.")
 
-    return StreamingResponse(video_stream(), media_type="video/mp4",
-                             headers={"Content-Disposition": 'attachment; filename="tiksave.mp4"'})
+    async def video_stream():
+        try:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+        finally:
+            await stream_context.__aexit__(None, None, None)
+            await client.aclose()
+
+    headers = {"Content-Disposition": 'attachment; filename="tiksave.mp4"'}
+    if response.headers.get("content-length"):
+        headers["Content-Length"] = response.headers["content-length"]
+    return StreamingResponse(video_stream(), media_type="video/mp4", headers=headers)
 
 
 @app.get("/api/highlights")
