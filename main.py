@@ -148,23 +148,101 @@ async def _telegram_send(chat_id: int, message: str):
         response.raise_for_status()
 
 
-def _telegram_download(url: str, folder: str):
-    """Download one MP4 video with audio; never choose audio-only formats."""
+TELEGRAM_MAX_VIDEO_BYTES = 45 * 1024 * 1024
+
+
+def _telegram_download_yt_dlp(url: str, folder: str):
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "socket_timeout": 20, "retries": 1,
         "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none][ext=mp4]",
         "outtmpl": str(Path(folder) / "video.%(ext)s"),
-        "max_filesize": 45 * 1024 * 1024,
+        "max_filesize": TELEGRAM_MAX_VIDEO_BYTES,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         path = Path(ydl.prepare_filename(info))
     if not path.is_file() or path.suffix.lower() != ".mp4":
-        raise ValueError("Vídeo MP4 indisponível.")
-    if path.stat().st_size > 45 * 1024 * 1024:
-        raise ValueError("Vídeo excede o limite de envio.")
+        raise ValueError("yt-dlp não retornou MP4.")
+    if path.stat().st_size > TELEGRAM_MAX_VIDEO_BYTES:
+        raise ValueError("MP4 excede 45 MB.")
     return (info or {}).get("title") or "Vídeo do TikTok", path
+
+
+def _telegram_download_tikwm(url: str, folder: str):
+    """Fallback for public TikTok videos. Reject photo posts and audio-only links."""
+    from urllib.parse import urljoin
+    import ipaddress
+    import socket
+
+    with httpx.Client(timeout=30, follow_redirects=False) as client:
+        response = client.get("https://www.tikwm.com/api/", params={"url": url, "hd": 1})
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") or {}
+        if not isinstance(data, dict) or payload.get("code") != 0:
+            raise ValueError("TikWM não encontrou vídeo.")
+        if data.get("images") or data.get("image_post_info"):
+            raise ValueError("Publicação de fotos, não de vídeo.")
+        media_url = data.get("hdplay") or data.get("play")
+        if not media_url:
+            raise ValueError("TikWM retornou somente áudio ou nenhum vídeo.")
+        media_url = urljoin("https://www.tikwm.com/", media_url)
+        path = Path(folder) / "video.mp4"
+        # Follow at most three redirects; reject non-HTTPS and private-network targets.
+        for _ in range(4):
+            parsed = urlparse(media_url)
+            hostname = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not hostname or parsed.username or parsed.password:
+                raise ValueError("URL de mídia inválida.")
+            if not (hostname == "tikwm.com" or hostname.endswith(".tikwm.com")
+                    or hostname == "tiktokcdn.com" or hostname.endswith(".tiktokcdn.com")
+                    or hostname.endswith(".tiktokcdn-us.com")
+                    or hostname.endswith(".byteoversea.com")
+                    or hostname.endswith(".byteoversea.net")
+                    or hostname.endswith(".ibytedtos.com")):
+                raise ValueError("Domínio de mídia não permitido.")
+            addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+            if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+                raise ValueError("Destino de rede não público.")
+            with client.stream("GET", media_url, headers={"Accept": "video/mp4"}) as media:
+                if media.status_code in (301, 302, 303, 307, 308):
+                    location = media.headers.get("location")
+                    if not location:
+                        raise ValueError("Redirecionamento inválido.")
+                    media_url = urljoin(media_url, location)
+                    continue
+                media.raise_for_status()
+                mime = media.headers.get("content-type", "").split(";")[0].strip().lower()
+                if mime.startswith("audio/") or mime in ("application/vnd.apple.mpegurl", "application/x-mpegurl"):
+                    raise ValueError("Resposta não contém vídeo MP4.")
+                total = 0
+                with path.open("wb") as output:
+                    for chunk in media.iter_bytes(chunk_size=65536):
+                        total += len(chunk)
+                        if total > TELEGRAM_MAX_VIDEO_BYTES:
+                            raise ValueError("Vídeo excede 45 MB.")
+                        output.write(chunk)
+                if total < 1024:
+                    raise ValueError("Arquivo de vídeo vazio.")
+                with path.open("rb") as check:
+                    header = check.read(32)
+                if b"ftyp" not in header[:16]:
+                    raise ValueError("Arquivo não é MP4.")
+                return data.get("title") or "Vídeo do TikTok", path
+        raise ValueError("Muitos redirecionamentos.")
+
+
+def _telegram_download(url: str, folder: str):
+    try:
+        return _telegram_download_yt_dlp(url, folder)
+    except Exception as first_error:
+        print(f"Telegram yt-dlp failed: {type(first_error).__name__}: {str(first_error)[:250]}")
+        try:
+            return _telegram_download_tikwm(url, folder)
+        except Exception as second_error:
+            print(f"Telegram TikWM fallback failed: {type(second_error).__name__}: {str(second_error)[:250]}")
+            raise ValueError("Nenhuma fonte conseguiu obter um vídeo MP4 válido.") from second_error
 
 
 async def _telegram_process_video(chat_id: int, url: str):
@@ -181,9 +259,10 @@ async def _telegram_process_video(chat_id: int, url: str):
                 response.raise_for_status()
                 if not response.json().get("ok"):
                     raise ValueError("Telegram recusou o envio.")
-    except Exception:
+    except Exception as error:
+        print(f"Telegram send failed: {type(error).__name__}: {str(error)[:250]}")
         try:
-            await _telegram_send(chat_id, "Não consegui enviar esse vídeo. Pode estar indisponível, ser grande demais ou não ter um MP4 compatível.")
+            await _telegram_send(chat_id, "Não consegui enviar esse vídeo. Ele pode estar indisponível, ser uma publicação de fotos ou ultrapassar 45 MB.")
         except Exception:
             pass
 
