@@ -848,11 +848,11 @@ async def _diagnose_piped_youtube_once():
 @app.on_event("startup")
 async def register_telegram_webhook():
     """Register webhook using Render environment secrets, without exposing them in a URL."""
+    # Run the metadata-only YouTube probe on every test region, even without Telegram credentials.
+    asyncio.create_task(_diagnose_youtube_node_once())
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
         print("Telegram webhook: credentials not configured; skipping registration.")
         return
-    asyncio.create_task(_diagnose_ytdlp_runtime_once())
-    asyncio.create_task(_diagnose_youtube_node_once())
     webhook_url = os.getenv(
         "TELEGRAM_WEBHOOK_URL",
         "https://tiksave-hd-1.onrender.com/api/telegram-webhook",
