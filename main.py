@@ -489,14 +489,14 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                 title, path = await asyncio.to_thread(downloader, url, folder)
             except Exception as cobalt_error:
                 host = (urlparse(url).hostname or "").lower()
-                if provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com")):
+                if provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com") or host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")):
                     raise
-                print(f"Telegram Instagram Cobalt failed; trying yt-dlp: {type(cobalt_error).__name__}", flush=True)
+                print(f"Telegram Cobalt failed for {host}; trying yt-dlp: {type(cobalt_error).__name__}", flush=True)
                 try:
                     title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                 except Exception as fallback_error:
-                    print(f"Telegram Instagram yt-dlp fallback failed: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
-                    raise ValueError("Instagram indisponível pelo Cobalt e pelo método alternativo.") from fallback_error
+                    print(f"Telegram yt-dlp fallback failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
+                    raise ValueError("Cobalt e yt-dlp não conseguiram acessar o vídeo.") from fallback_error
             async with httpx.AsyncClient(timeout=120) as client:
                 with path.open("rb") as video:
                     response = await client.post(
