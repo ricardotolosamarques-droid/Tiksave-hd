@@ -649,6 +649,11 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                 except Exception as fallback_error:
                     print(f"Telegram alternative download failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
                     if host == "instagram.com" or host.endswith(".instagram.com"):
+                        if "/stories/" in urlparse(url).path.lower():
+                            story_parts = [part for part in urlparse(url).path.split("/") if part]
+                            story_id = story_parts[2] if len(story_parts) >= 3 else "unknown"
+                            print(f"Telegram Instagram Story unavailable: story_id={story_id}; cause={type(fallback_error).__name__}", flush=True)
+                            raise ValueError("Não foi possível acessar este Story pelo servidor. Mesmo em perfis públicos, o Instagram pode exigir login para Stories. Reels e publicações continuam disponíveis.") from fallback_error
                         raise ValueError("O Instagram está bloqueando o acesso automático do servidor. Cobalt, parth-dl, gallery-dl e yt-dlp não conseguiram extrair o vídeo.") from fallback_error
                     if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
                         raise ValueError("O YouTube está exigindo verificação ou login do servidor; Cobalt, yt-dlp e pytubefix falharam.") from fallback_error
