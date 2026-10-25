@@ -350,7 +350,7 @@ def _probe_ytdlp_candidate(fmt):
                         return False
                     # A successful response alone is insufficient: read a small chunk.
                     chunk = next(response.iter_content(chunk_size=1024), b"")
-                    return bool(chunk) or True  # Empty ranged response is inconclusive
+                    return True  # A valid video MIME is enough for this lightweight check
         return True
     except Exception:
         return True
