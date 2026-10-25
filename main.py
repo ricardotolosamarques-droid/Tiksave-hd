@@ -2,6 +2,8 @@ import asyncio
 import os
 import re
 import tempfile
+import secrets
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
@@ -12,7 +14,7 @@ import yt_dlp
 app = FastAPI(title="TikSave HD Backend", version="2.1")
 
 # Dicionário de tokens para o proxy (ajuste conforme a sua implementação atual)
-download_tokens = {}
+download_tokens = {}  # token -> (media URL, expiry timestamp)
 
 @app.get("/")
 def home():
@@ -31,15 +33,15 @@ def _site_extract_yt_dlp(url: str):
         candidates.append(fmt)
     candidates.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
     if not candidates:
-        raise ValueError("yt-dlp não encontrou vídeo MP4 com áudio.")
-    return {"status": "ok", "source": "yt-dlp", "links": [
-        {"url": f["url"], "label": f"MP4 • {f.get('height') or '?'}p",
-         "source": "yt-dlp", "width": f.get("width"), "height": f.get("height"),
-         "bitrate_kbps": f.get("tbr"), "quality_verified": False}
-        for f in candidates[:4]]}
+        raise ValueError("yt-dlp não encontrou MP4 com áudio.")
+    return [{"url": f["url"], "label": f"yt-dlp • {f.get('height') or '?'}p",
+             "source": "yt-dlp", "width": f.get("width"), "height": f.get("height"),
+             "bitrate_kbps": f.get("tbr"), "quality_verified": False}
+            for f in candidates[:3]]
 
 
 def _site_extract_tikwm(url: str):
+    from urllib.parse import urljoin
     with httpx.Client(timeout=25) as client:
         response = client.get("https://www.tikwm.com/api/", params={"url": url, "hd": 1})
         response.raise_for_status()
@@ -48,16 +50,13 @@ def _site_extract_tikwm(url: str):
     if payload.get("code") != 0 or not isinstance(data, dict):
         raise ValueError("TikWM indisponível.")
     links = []
-    for key, label in (("hdplay", "HD sem marca d'água"), ("play", "Sem marca d'água")):
+    for key, label in (("hdplay", "TikWM • HD"), ("play", "TikWM • Sem marca d'água")):
         media = data.get(key)
         if media:
-            from urllib.parse import urljoin
             media = urljoin("https://www.tikwm.com/", media)
             if media.startswith("https://") and media not in [v["url"] for v in links]:
                 links.append({"url": media, "label": label, "source": "tikwm", "quality_verified": False})
-    if not links:
-        raise ValueError("TikWM não encontrou vídeo.")
-    return {"status": "ok", "source": "tikwm", "links": links}
+    return links
 
 
 @app.post("/api/download")
@@ -70,17 +69,86 @@ async def api_download(payload: dict):
             raise ValueError()
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Insira um link HTTPS válido do TikTok.")
-    for extractor in (_site_extract_yt_dlp, _site_extract_tikwm):
-        try:
-            return await asyncio.to_thread(extractor, url)
-        except Exception as error:
-            print(f"Site {extractor.__name__} failed: {type(error).__name__}: {str(error)[:200]}")
-    raise HTTPException(status_code=502, detail="Não foi possível obter o vídeo. Tente novamente mais tarde.")
+    # Always try both providers so the UI can offer real alternatives.
+    results = await asyncio.gather(
+        asyncio.to_thread(_site_extract_tikwm, url),
+        asyncio.to_thread(_site_extract_yt_dlp, url),
+        return_exceptions=True,
+    )
+    links = []
+    for source, result in zip(("tikwm", "yt-dlp"), results):
+        if isinstance(result, Exception):
+            print(f"Site {source} failed: {type(result).__name__}: {str(result)[:160]}")
+            continue
+        for item in result:
+            media = item["url"]
+            parsed_media = urlparse(media)
+            if parsed_media.scheme != "https" or not parsed_media.hostname:
+                continue
+            # Do not expose provider URLs to the frontend: proxy via expiring token.
+            token = secrets.token_urlsafe(24)
+            download_tokens[token] = (media, time.time() + 900)
+            links.append({**item, "url": f"/api/file?token={token}"})
+    if not links:
+        raise HTTPException(status_code=502, detail="Nenhuma fonte conseguiu obter o vídeo.")
+    # Avoid retaining tokens indefinitely on a long-running server.
+    now = time.time()
+    for token, (_, expiry) in list(download_tokens.items()):
+        if expiry < now:
+            download_tokens.pop(token, None)
+    return {"status": "ok", "source": links[0]["source"], "links": links}
 
 
 @app.get("/api/file")
 async def proxy_file(token: str):
-    raise HTTPException(status_code=404, detail="Link de download expirado. Faça uma nova busca.")
+    import ipaddress
+    import socket
+    from urllib.parse import urljoin
+    entry = download_tokens.get(token)
+    if not entry or entry[1] < time.time():
+        raise HTTPException(status_code=404, detail="Link expirado. Faça nova busca.")
+    media_url = entry[0]
+    # Reject arbitrary/private network destinations even after redirects.
+    def safe_url(value):
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+            return False
+        allowed = ("tikwm.com", "tiktokcdn.com", "tiktokcdn-us.com",
+                   "byteoversea.com", "byteoversea.net", "ibytedtos.com",
+                   "tiktokv.com", "tiktok.com", "muscdn.com")
+        if not any(host == h or host.endswith("." + h) for h in allowed):
+            return False
+        try:
+            addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            return bool(addresses) and all(ipaddress.ip_address(a[4][0]).is_global for a in addresses)
+        except OSError:
+            return False
+
+    async def video_stream():
+        async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
+            current = media_url
+            for _ in range(5):
+                if not await asyncio.to_thread(safe_url, current):
+                    raise ValueError("Destino de mídia não permitido.")
+                async with client.stream("GET", current) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError("Redirecionamento inválido.")
+                        current = urljoin(current, location)
+                        continue
+                    response.raise_for_status()
+                    mime = response.headers.get("content-type", "").lower()
+                    if mime.startswith("audio/"):
+                        raise ValueError("A fonte retornou apenas áudio.")
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+                    return
+            raise ValueError("Muitos redirecionamentos.")
+
+    return StreamingResponse(video_stream(), media_type="video/mp4",
+                             headers={"Content-Disposition": 'attachment; filename="tiksave.mp4"'})
 
 
 @app.get("/api/highlights")
