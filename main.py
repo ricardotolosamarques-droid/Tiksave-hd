@@ -773,6 +773,27 @@ async def _diagnose_invidious_youtube_once():
             print(f"YouTube Invidious diagnostic: host={host} error={type(error).__name__}: {str(error)[:120]}", flush=True)
 
 
+async def _diagnose_ytdlp_runtime_once():
+    """Report installed JS runtimes and yt-dlp version, without changing downloads."""
+    import shutil
+    import subprocess
+    for binary in ("deno", "node", "bun", "qjs"):
+        executable = shutil.which(binary)
+        if not executable:
+            print(f"YouTube runtime diagnostic: {binary}=missing", flush=True)
+            continue
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run, [executable, "--version"],
+                capture_output=True, text=True, timeout=5, check=False
+            )
+            version = (result.stdout or result.stderr).strip().splitlines()
+            print(f"YouTube runtime diagnostic: {binary}=present version={(version[0] if version else 'unknown')[:90]}", flush=True)
+        except Exception as error:
+            print(f"YouTube runtime diagnostic: {binary}=present check_error={type(error).__name__}", flush=True)
+    print(f"YouTube runtime diagnostic: yt_dlp_version={yt_dlp.version.__version__}", flush=True)
+
+
 async def _diagnose_piped_youtube_once():
     """One-off metadata-only probe for public Piped API instances; never downloads files."""
     video_id = "YefI9Vz7ET0"
@@ -807,6 +828,7 @@ async def register_telegram_webhook():
         print("Telegram webhook: credentials not configured; skipping registration.")
         return
     asyncio.create_task(_diagnose_piped_youtube_once())
+    asyncio.create_task(_diagnose_ytdlp_runtime_once())
     webhook_url = os.getenv(
         "TELEGRAM_WEBHOOK_URL",
         "https://tiksave-hd-1.onrender.com/api/telegram-webhook",
