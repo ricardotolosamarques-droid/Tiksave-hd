@@ -277,7 +277,7 @@ def _telegram_link_from_message(message_text: str):
         "reddit": ("reddit.com", "redd.it"),
         "pinterest": ("pinterest.com", "pin.it"),
     }
-    for raw in re.findall(r"https://[^\\s<>]+", message_text):
+    for raw in re.findall(r"https://[^\s<>]+", message_text):
         candidate = raw.rstrip(".,!?)")
         try:
             parsed = urlparse(candidate)
