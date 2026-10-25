@@ -369,7 +369,7 @@ def _telegram_download_parth_dl(url: str, folder: str):
 
     output_dir = Path(folder) / "parth_dl"
     output_dir.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, "-m", "parth_dl", "--output", str(output_dir), url]
+    command = [sys.executable, "-m", "parth_dl", "--paths", str(output_dir), url]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=100, check=False, cwd=str(output_dir))
     except subprocess.TimeoutExpired as error:
