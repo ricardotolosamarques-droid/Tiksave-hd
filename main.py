@@ -256,6 +256,46 @@ def health():
     return {"status": "online", "service": "TikSave HD", "version": "3.2.2"}
 
 
+async def _probe_tikwm_video(url):
+    """Check TikWM media type without downloading the full file."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    # Never allow the provider to make the backend request arbitrary hosts.
+    if (parsed.scheme != "https" or parsed.port not in (None, 443)
+            or parsed.username or parsed.password
+            or not (host == "tikwm.com" or host.endswith(".tikwm.com")
+                    or host == "tikwm.net" or host.endswith(".tikwm.net"))):
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+            async with client.stream(
+                "GET", url, headers={"Range": "bytes=0-4095",
+                                     "Accept": "video/*,application/octet-stream"}
+            ) as response:
+                if response.status_code not in (200, 206):
+                    return False
+                mime = response.headers.get("content-type", "").split(";", 1)[0].lower().strip()
+                if mime.startswith("audio/"):
+                    return False
+                if mime not in ("video/mp4", "video/webm", "video/quicktime",
+                                "application/octet-stream", "binary/octet-stream"):
+                    return False
+                sample = b""
+                async for chunk in response.aiter_bytes():
+                    sample += chunk[:4096 - len(sample)]
+                    if len(sample) >= 64:
+                        break
+                if sample.startswith((b"ID3", b"OggS", b"fLaC", b"RIFF")):
+                    return False
+                # Reject common audio-only AAC/MP3 frame signatures.
+                if len(sample) >= 2 and sample[0] == 0xff and (sample[1] & 0xf0) == 0xf0:
+                    return False
+                # MP4 and WebM containers can carry video; unknown files are hidden.
+                return (len(sample) >= 12 and sample[4:8] == b"ftyp") or sample.startswith(b"\\x1a\\x45\\xdf\\xa3")
+    except (httpx.HTTPError, ValueError, TypeError):
+        return False
+
+
 async def _tikwm_fallback(video_url):
     try:
         async with httpx.AsyncClient(timeout=35, follow_redirects=False) as client:
@@ -275,8 +315,9 @@ async def _tikwm_fallback(video_url):
         for field, label in (("hdplay", "TikWM • HD"), ("play", "TikWM • padrão")):
             url = safe_media_url(video.get(field))
             if url and all(item["url"] != url for item in links):
-                links.append({"url": url, "label": label, "source": "tikwm",
-                              "quality_verified": False})
+                if await _probe_tikwm_video(url):
+                    links.append({"url": url, "label": label, "source": "tikwm",
+                                  "quality_verified": False, "link_tested": True})
         return links, f"{len(links)}_links"
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         return [], type(exc).__name__
