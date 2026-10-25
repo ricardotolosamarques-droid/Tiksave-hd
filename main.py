@@ -274,6 +274,10 @@ async def _probe_tikwm_video(url):
     """Only show TikWM media if a small ranged download proves a video track."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().rstrip(".")
+    # TikTok Notes media URLs have been observed returning audio-only files
+    # under video/mp4; do not expose them as TikWM video downloads.
+    if host == "v16-notes.tiktokcdn-us.com":
+        return False
     if (parsed.scheme != "https" or parsed.port not in (None, 443)
             or parsed.username or parsed.password):
         return False
