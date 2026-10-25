@@ -510,6 +510,12 @@ async def download_file(token: str = Query(..., min_length=20)):
                     detail=f"CDN retornou HTTP {response.status_code} (curl_cffi)."
                 )
             content_type = response.headers.get("content-type", "").lower()
+            # Explicitly reject audio-only responses before starting a download.
+            if content_type.split(";", 1)[0].strip().startswith("audio/"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="O download de arquivos de áudio não é permitido."
+                )
             length = response.headers.get("content-length", "")
             if not (content_type.startswith("video/") or
                     content_type.startswith("application/octet-stream")):
