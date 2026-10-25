@@ -6,3 +6,4 @@ yt-dlp[default]
 curl_cffi
 gallery-dl
 parth-dl
+pytubefix==11.2.1
