@@ -266,20 +266,30 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 
-def _tiktok_link_from_message(message_text: str):
-    """Accept only an HTTPS TikTok URL, not arbitrary yt-dlp targets."""
+def _telegram_link_from_message(message_text: str):
+    """Allow only HTTPS links from explicitly supported social platforms."""
+    platforms = {
+        "tiktok": ("tiktok.com",),
+        "instagram": ("instagram.com",),
+        "youtube": ("youtube.com", "youtu.be"),
+        "facebook": ("facebook.com", "fb.watch"),
+        "twitter": ("twitter.com", "x.com"),
+        "reddit": ("reddit.com", "redd.it"),
+        "pinterest": ("pinterest.com", "pin.it"),
+    }
     for raw in re.findall(r"https://[^\\s<>]+", message_text):
         candidate = raw.rstrip(".,!?)")
         try:
             parsed = urlparse(candidate)
             host = (parsed.hostname or "").lower().rstrip(".")
-            if (parsed.scheme == "https" and parsed.port in (None, 443)
-                    and parsed.username is None and parsed.password is None
-                    and (host == "tiktok.com" or host.endswith(".tiktok.com"))):
-                return candidate
+            if parsed.scheme != "https" or parsed.port not in (None, 443) or parsed.username or parsed.password:
+                continue
+            for platform, domains in platforms.items():
+                if any(host == domain or host.endswith("." + domain) for domain in domains):
+                    return candidate, platform
         except ValueError:
             continue
-    return None
+    return None, None
 
 
 async def _telegram_send(chat_id: int, message: str):
@@ -296,23 +306,23 @@ telegram_choices = {}  # choice ID -> (chat ID, TikTok URL, expiry)
 TELEGRAM_CHOICE_TTL = 1800
 
 
-async def _telegram_show_choices(chat_id: int, url: str):
+async def _telegram_show_choices(chat_id: int, url: str, platform: str):
     now = time.time()
     for key, item in list(telegram_choices.items()):
         if item[2] < now:
             telegram_choices.pop(key, None)
     choice_id = secrets.token_urlsafe(12)
     telegram_choices[choice_id] = (chat_id, url, now + TELEGRAM_CHOICE_TTL)
+    buttons = [{"text": "Cobalt", "callback_data": f"dl:cobalt:{choice_id}"}]
+    if platform == "tiktok":
+        buttons.insert(0, {"text": "TikWM", "callback_data": f"dl:tikwm:{choice_id}"})
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={
                 "chat_id": chat_id,
                 "text": "Escolha uma opção:",
-                "reply_markup": {"inline_keyboard": [[
-                    {"text": "TikWM", "callback_data": f"dl:tikwm:{choice_id}"},
-                    {"text": "Cobalt", "callback_data": f"dl:cobalt:{choice_id}"},
-                ]]},
+                "reply_markup": {"inline_keyboard": [buttons]},
             },
         )
         response.raise_for_status()
@@ -528,14 +538,14 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"status": "ok"}
 
     if message_text.strip().startswith("/start"):
-        await _telegram_send(chat_id, "Olá! Envie um link do TikTok e escolha entre TikWM e Cobalt.")
+        await _telegram_send(chat_id, "Olá! Envie um link público do TikTok, Instagram, YouTube, Facebook, X, Reddit ou Pinterest. Para TikTok: TikWM ou Cobalt. Para as demais redes: Cobalt.")
         return {"status": "ok"}
 
-    url = _tiktok_link_from_message(message_text)
+    url, platform = _telegram_link_from_message(message_text)
     if not url:
         return {"status": "ok"}
 
-    await _telegram_show_choices(chat_id, url)
+    await _telegram_show_choices(chat_id, url, platform)
     return {"status": "ok"}
 
 
