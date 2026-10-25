@@ -464,7 +464,7 @@ def _telegram_download_cobalt(url: str, folder: str):
                 with path.open("rb") as f:
                     if b"ftyp" not in f.read(16):
                         raise ValueError("Cobalt não retornou MP4.")
-                return "Vídeo do TikTok • Cobalt", path
+                return "Vídeo • Cobalt", path
     raise ValueError("Muitos redirecionamentos.")
 
 
@@ -485,7 +485,18 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
     try:
         with tempfile.TemporaryDirectory(prefix="tiksave_telegram_") as folder:
             downloader = {"tikwm": _telegram_download_tikwm, "cobalt": _telegram_download_cobalt}[provider]
-            title, path = await asyncio.to_thread(downloader, url, folder)
+            try:
+                title, path = await asyncio.to_thread(downloader, url, folder)
+            except Exception as cobalt_error:
+                host = (urlparse(url).hostname or "").lower()
+                if provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com")):
+                    raise
+                print(f"Telegram Instagram Cobalt failed; trying yt-dlp: {type(cobalt_error).__name__}", flush=True)
+                try:
+                    title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                except Exception as fallback_error:
+                    print(f"Telegram Instagram yt-dlp fallback failed: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
+                    raise ValueError("Instagram indisponível pelo Cobalt e pelo método alternativo.") from fallback_error
             async with httpx.AsyncClient(timeout=120) as client:
                 with path.open("rb") as video:
                     response = await client.post(
