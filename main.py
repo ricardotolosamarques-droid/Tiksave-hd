@@ -360,6 +360,39 @@ def _telegram_download_yt_dlp(url: str, folder: str):
     return (info or {}).get("title") or "Vídeo do TikTok", path
 
 
+
+def _telegram_download_gallery_dl(url: str, folder: str):
+    """Download public Instagram video posts using gallery-dl, without cookies."""
+    import subprocess
+    import sys
+
+    output_dir = Path(folder) / "gallery_dl"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable, "-m", "gallery_dl",
+        "--directory", str(output_dir),
+        "--filter", "extension == 'mp4'",
+        url,
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=100, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("gallery-dl demorou demais para acessar o Instagram.") from error
+    videos = sorted((p for p in output_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".mp4"), key=lambda p: p.stat().st_size, reverse=True)
+    if not videos:
+        print(f"Telegram Instagram gallery-dl failed: exit={result.returncode}; {(result.stderr or result.stdout)[-350:]}", flush=True)
+        raise ValueError("gallery-dl não encontrou vídeo MP4 público.")
+    video = videos[0]
+    if video.stat().st_size > TELEGRAM_MAX_VIDEO_BYTES:
+        raise ValueError("Vídeo do Instagram excede 45 MB.")
+    if video.stat().st_size < 1024:
+        raise ValueError("gallery-dl retornou arquivo vazio.")
+    with video.open("rb") as f:
+        if b"ftyp" not in f.read(16):
+            raise ValueError("gallery-dl não retornou MP4 válido.")
+    return "Vídeo do Instagram • gallery-dl", video
+
+
 def _telegram_download_tikwm(url: str, folder: str):
     """Fallback for public TikTok videos. Reject photo posts and audio-only links."""
     from urllib.parse import urljoin
@@ -493,10 +526,17 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                     raise
                 print(f"Telegram Cobalt failed for {host}; trying yt-dlp: {type(cobalt_error).__name__}", flush=True)
                 try:
-                    title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                    if host == "instagram.com" or host.endswith(".instagram.com"):
+                        try:
+                            title, path = await asyncio.to_thread(_telegram_download_gallery_dl, url, folder)
+                        except Exception as gallery_error:
+                            print(f"Telegram Instagram gallery-dl failed: {type(gallery_error).__name__}: {str(gallery_error)[:180]}", flush=True)
+                            title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                    else:
+                        title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                 except Exception as fallback_error:
-                    print(f"Telegram yt-dlp fallback failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
-                    raise ValueError("Cobalt e yt-dlp não conseguiram acessar o vídeo.") from fallback_error
+                    print(f"Telegram alternative download failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
+                    raise ValueError("Nenhum extrator conseguiu acessar o vídeo.") from fallback_error
             async with httpx.AsyncClient(timeout=120) as client:
                 with path.open("rb") as video:
                     response = await client.post(
