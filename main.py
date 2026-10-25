@@ -362,6 +362,32 @@ def _telegram_download_yt_dlp(url: str, folder: str):
 
 
 
+
+def _telegram_download_pytubefix(url: str, folder: str):
+    """Try public YouTube video with pytubefix, without account authentication."""
+    from pytubefix import YouTube
+    from pathlib import Path
+
+    yt = YouTube(url)
+    streams = yt.streams.filter(progressive=True, file_extension="mp4")
+    candidates = sorted(
+        (stream for stream in streams if stream.filesize and stream.filesize <= TELEGRAM_MAX_VIDEO_BYTES),
+        key=lambda stream: stream.resolution or "",
+        reverse=True,
+    )
+    if not candidates:
+        raise ValueError("pytubefix não encontrou MP4 com áudio dentro do limite de 45 MB.")
+    target = Path(folder) / "pytubefix"
+    target.mkdir(parents=True, exist_ok=True)
+    path = Path(candidates[0].download(output_path=str(target), filename="youtube.mp4"))
+    if not path.is_file() or not 1024 <= path.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES:
+        raise ValueError("pytubefix não retornou MP4 válido dentro do limite.")
+    with path.open("rb") as file:
+        if b"ftyp" not in file.read(16):
+            raise ValueError("pytubefix retornou arquivo que não é MP4.")
+    return (yt.title or "Vídeo do YouTube"), path
+
+
 def _telegram_download_parth_dl(url: str, folder: str):
     """Try public Instagram extraction using parth-dl without authentication."""
     import subprocess
@@ -572,13 +598,19 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                                 print(f"Telegram Instagram gallery-dl failed: {type(gallery_error).__name__}: {str(gallery_error)[:180]}", flush=True)
                                 title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                     else:
-                        title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                        try:
+                            title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                        except Exception as youtube_yt_error:
+                            print(f"Telegram YouTube yt-dlp failed: {type(youtube_yt_error).__name__}: {str(youtube_yt_error)[:180]}", flush=True)
+                            title, path = await asyncio.wait_for(
+                                asyncio.to_thread(_telegram_download_pytubefix, url, folder), timeout=100
+                            )
                 except Exception as fallback_error:
                     print(f"Telegram alternative download failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
                     if host == "instagram.com" or host.endswith(".instagram.com"):
                         raise ValueError("O Instagram está bloqueando o acesso automático do servidor. Cobalt, parth-dl, gallery-dl e yt-dlp não conseguiram extrair o vídeo.") from fallback_error
                     if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
-                        raise ValueError("O YouTube está exigindo verificação ou login do servidor; Cobalt e yt-dlp falharam.") from fallback_error
+                        raise ValueError("O YouTube está exigindo verificação ou login do servidor; Cobalt, yt-dlp e pytubefix falharam.") from fallback_error
                     raise ValueError("Nenhum extrator conseguiu acessar o vídeo.") from fallback_error
             import mimetypes
             from contextlib import ExitStack
