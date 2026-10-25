@@ -369,7 +369,7 @@ def _telegram_download_parth_dl(url: str, folder: str):
 
     output_dir = Path(folder) / "parth_dl"
     output_dir.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, "-m", "parth_dl", "--paths", str(output_dir), url]
+    command = ["parth-dl", "--paths", str(output_dir), "--no-banner", "--quiet", url]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=100, check=False, cwd=str(output_dir))
     except subprocess.TimeoutExpired as error:
@@ -590,7 +590,7 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
         try:
             message = str(error)
             if "Instagram está bloqueando" in message:
-                reply = "O Instagram está exigindo login ou bloqueando o acesso do servidor. Testei Cobalt, gallery-dl e yt-dlp, mas nenhum conseguiu obter esse vídeo. Não é um problema de 45 MB."
+                reply = "O Instagram está exigindo login ou bloqueando o acesso do servidor. Cobalt, parth-dl, gallery-dl e yt-dlp não conseguiram obter esse vídeo. Não é um problema de 45 MB."
             elif "YouTube está exigindo" in message:
                 reply = "O YouTube está exigindo verificação/login do servidor. Cobalt e yt-dlp falharam; não é um problema de 45 MB."
             elif "excede 45 MB" in message:
