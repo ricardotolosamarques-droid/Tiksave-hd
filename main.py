@@ -319,6 +319,12 @@ async def _tikwm_fallback(video_url):
         video = payload.get("data")
         if not isinstance(video, dict):
             return [], "sem_dados"
+        # TikWM can return the soundtrack of a photo carousel under a
+        # generic play/hdplay field. Those are not downloadable videos.
+        images = video.get("images")
+        image_post = video.get("image_post_info")
+        if (isinstance(images, list) and len(images) > 0) or image_post:
+            return [], "post_de_fotos_audio_omitido"
         links = []
         for field, label in (("hdplay", "TikWM • HD"), ("play", "TikWM • padrão")):
             url = safe_media_url(video.get(field))
