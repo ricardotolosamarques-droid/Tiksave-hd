@@ -361,6 +361,34 @@ def _telegram_download_yt_dlp(url: str, folder: str):
 
 
 
+
+def _telegram_download_parth_dl(url: str, folder: str):
+    """Try public Instagram extraction using parth-dl without authentication."""
+    import subprocess
+    import sys
+
+    output_dir = Path(folder) / "parth_dl"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, "-m", "parth_dl", "--output", str(output_dir), url]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=100, check=False, cwd=str(output_dir))
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("parth-dl excedeu o tempo limite.") from error
+    videos = sorted((p for p in output_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".mp4"), key=lambda p: p.stat().st_size, reverse=True)
+    if not videos:
+        print(f"Telegram parth-dl failed: exit={result.returncode}; {(result.stderr or result.stdout)[-300:]}", flush=True)
+        raise ValueError("parth-dl não conseguiu obter vídeo público.")
+    video = videos[0]
+    if video.stat().st_size > TELEGRAM_MAX_VIDEO_BYTES:
+        raise ValueError("Vídeo excede 45 MB.")
+    if video.stat().st_size < 1024:
+        raise ValueError("parth-dl retornou arquivo vazio.")
+    with video.open("rb") as file:
+        if b"ftyp" not in file.read(16):
+            raise ValueError("parth-dl retornou arquivo que não é MP4.")
+    return "Vídeo do Instagram • parth-dl", video
+
+
 def _telegram_download_gallery_dl(url: str, folder: str):
     """Download public Instagram video posts using gallery-dl, without cookies."""
     import subprocess
@@ -530,16 +558,20 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                 try:
                     if host == "instagram.com" or host.endswith(".instagram.com"):
                         try:
-                            title, path = await asyncio.to_thread(_telegram_download_gallery_dl, url, folder)
-                        except Exception as gallery_error:
-                            print(f"Telegram Instagram gallery-dl failed: {type(gallery_error).__name__}: {str(gallery_error)[:180]}", flush=True)
-                            title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                            title, path = await asyncio.to_thread(_telegram_download_parth_dl, url, folder)
+                        except Exception as parth_error:
+                            print(f"Telegram Instagram parth-dl failed: {type(parth_error).__name__}: {str(parth_error)[:180]}", flush=True)
+                            try:
+                                title, path = await asyncio.to_thread(_telegram_download_gallery_dl, url, folder)
+                            except Exception as gallery_error:
+                                print(f"Telegram Instagram gallery-dl failed: {type(gallery_error).__name__}: {str(gallery_error)[:180]}", flush=True)
+                                title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                     else:
                         title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                 except Exception as fallback_error:
                     print(f"Telegram alternative download failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
                     if host == "instagram.com" or host.endswith(".instagram.com"):
-                        raise ValueError("O Instagram está bloqueando o acesso automático do servidor. Cobalt, gallery-dl e yt-dlp não conseguiram extrair o vídeo.") from fallback_error
+                        raise ValueError("O Instagram está bloqueando o acesso automático do servidor. Cobalt, parth-dl, gallery-dl e yt-dlp não conseguiram extrair o vídeo.") from fallback_error
                     if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
                         raise ValueError("O YouTube está exigindo verificação ou login do servidor; Cobalt e yt-dlp falharam.") from fallback_error
                     raise ValueError("Nenhum extrator conseguiu acessar o vídeo.") from fallback_error
