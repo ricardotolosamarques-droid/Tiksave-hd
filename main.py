@@ -59,6 +59,43 @@ def _site_extract_tikwm(url: str):
     return links
 
 
+# Cobalt requires a working API instance, configured in Render.
+COBALT_API_URL = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
+COBALT_API_KEY = os.getenv("COBALT_API_KEY", "").strip()
+
+
+def _site_extract_cobalt(url: str):
+    if not COBALT_API_URL:
+        raise ValueError("COBALT_API_URL não configurada no Render.")
+    parsed = urlparse(COBALT_API_URL)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("COBALT_API_URL deve ser HTTPS.")
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if COBALT_API_KEY:
+        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+    with httpx.Client(timeout=35, follow_redirects=False) as client:
+        response = client.post(
+            COBALT_API_URL,
+            json={"url": url, "videoQuality": "max", "filenameStyle": "basic"},
+            headers=headers,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    status = payload.get("status")
+    candidates = []
+    if status in ("tunnel", "redirect") and payload.get("url"):
+        candidates.append(payload["url"])
+    elif status == "picker":
+        for item in payload.get("picker") or []:
+            if item.get("type") == "video" and item.get("url"):
+                candidates.append(item["url"])
+    if not candidates:
+        raise ValueError(f"Cobalt não retornou vídeo (status={status}).")
+    return [{"url": media, "label": "Cobalt • Vídeo", "source": "cobalt",
+             "quality_verified": False} for media in candidates[:3]
+            if urlparse(media).scheme == "https"]
+
+
 @app.post("/api/download")
 async def api_download(payload: dict):
     url = payload.get("url", "")
@@ -73,10 +110,11 @@ async def api_download(payload: dict):
     results = await asyncio.gather(
         asyncio.to_thread(_site_extract_tikwm, url),
         asyncio.to_thread(_site_extract_yt_dlp, url),
+        asyncio.to_thread(_site_extract_cobalt, url),
         return_exceptions=True,
     )
     links = []
-    for source, result in zip(("tikwm", "yt-dlp"), results):
+    for source, result in zip(("tikwm", "yt-dlp", "cobalt"), results):
         if isinstance(result, Exception):
             print(f"Site {source} failed: {type(result).__name__}: {str(result)[:160]}")
             continue
@@ -116,7 +154,8 @@ async def proxy_file(token: str):
             return False
         allowed = ("tikwm.com", "tiktokcdn.com", "tiktokcdn-us.com",
                    "byteoversea.com", "byteoversea.net", "ibytedtos.com",
-                   "tiktokv.com", "tiktok.com", "muscdn.com")
+                   "tiktokv.com", "tiktok.com", "muscdn.com",
+                   "cobalt.tools", "cobalt-api.me", "cobaltcdn.com")
         if not any(host == h or host.endswith("." + h) for h in allowed):
             return False
         try:
@@ -300,16 +339,61 @@ def _telegram_download_tikwm(url: str, folder: str):
         raise ValueError("Muitos redirecionamentos.")
 
 
+def _telegram_download_cobalt(url: str, folder: str):
+    import ipaddress
+    import socket
+    from urllib.parse import urljoin
+    results = _site_extract_cobalt(url)
+    if not results:
+        raise ValueError("Cobalt não retornou vídeo.")
+    media_url = results[0]["url"]
+    path = Path(folder) / "cobalt_video.mp4"
+    with httpx.Client(timeout=60, follow_redirects=False) as client:
+        for _ in range(5):
+            parsed = urlparse(media_url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+                raise ValueError("URL de mídia inválida.")
+            addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+                raise ValueError("Destino de mídia não público.")
+            with client.stream("GET", media_url) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("Redirecionamento sem destino.")
+                    media_url = urljoin(media_url, location)
+                    continue
+                response.raise_for_status()
+                if response.headers.get("content-type", "").lower().startswith("audio/"):
+                    raise ValueError("Cobalt retornou áudio.")
+                total = 0
+                with path.open("wb") as output:
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        total += len(chunk)
+                        if total > TELEGRAM_MAX_VIDEO_BYTES:
+                            raise ValueError("Vídeo excede 45 MB.")
+                        output.write(chunk)
+                if total < 1024:
+                    raise ValueError("Vídeo vazio.")
+                with path.open("rb") as f:
+                    if b"ftyp" not in f.read(16):
+                        raise ValueError("Cobalt não retornou MP4.")
+                return "Vídeo do TikTok • Cobalt", path
+    raise ValueError("Muitos redirecionamentos.")
+
+
 def _telegram_download(url: str, folder: str):
-    try:
-        return _telegram_download_yt_dlp(url, folder)
-    except Exception as first_error:
-        print(f"Telegram yt-dlp failed: {type(first_error).__name__}: {str(first_error)[:250]}")
+    for name, downloader in (
+        ("yt-dlp", _telegram_download_yt_dlp),
+        ("TikWM", _telegram_download_tikwm),
+        ("Cobalt", _telegram_download_cobalt),
+    ):
         try:
-            return _telegram_download_tikwm(url, folder)
-        except Exception as second_error:
-            print(f"Telegram TikWM fallback failed: {type(second_error).__name__}: {str(second_error)[:250]}")
-            raise ValueError("Nenhuma fonte conseguiu obter um vídeo MP4 válido.") from second_error
+            return downloader(url, folder)
+        except Exception as error:
+            print(f"Telegram {name} failed: {type(error).__name__}: {str(error)[:200]}")
+    raise ValueError("Nenhuma fonte conseguiu obter um vídeo MP4 válido.")
 
 
 async def _telegram_process_video(chat_id: int, url: str):
