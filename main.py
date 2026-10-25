@@ -273,6 +273,64 @@ async def _tikwm_fallback(video_url):
         return [], type(exc).__name__
 
 
+def _probe_ytdlp_candidate(fmt):
+    """Check CDN accessibility with a tiny ranged request, never downloading the full video."""
+    from curl_cffi import requests as curl_requests
+    target = fmt["url"]
+    if not _allowed_cdn(target) or not _public_dns(urlparse(target).hostname):
+        return False
+    allowed = {"user-agent", "referer", "origin", "accept", "accept-language"}
+    headers = {k: v for k, v in fmt.get("http_headers", {}).items()
+               if isinstance(k, str) and isinstance(v, str) and k.lower() in allowed}
+    headers["Range"] = "bytes=0-1023"
+    headers.setdefault("Accept", "video/mp4,*/*")
+    try:
+        with curl_requests.Session(impersonate="chrome") as session:
+            current = target
+            for _ in range(4):
+                if not _allowed_cdn(current) or not _public_dns(urlparse(current).hostname):
+                    return False
+                with session.get(current, headers=headers, stream=True,
+                                 allow_redirects=False, timeout=7) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        location = response.headers.get("location")
+                        if not location:
+                            return False
+                        current = urljoin(current, location)
+                        continue
+                    if response.status_code not in (200, 206):
+                        return False
+                    mime = response.headers.get("content-type", "").lower()
+                    if not (mime.startswith("video/") or
+                            mime.startswith("application/octet-stream")):
+                        return False
+                    # A successful response alone is insufficient: read a small chunk.
+                    chunk = next(response.iter_content(chunk_size=1024), b"")
+                    return bool(chunk)
+        return False
+    except Exception:
+        return False
+
+
+async def _verified_ytdlp_candidates(candidates):
+    # Limit probing to 4 best formats and run checks concurrently.
+    ordered = sorted(candidates, key=lambda f: (
+        f["width"] * f["height"], f["bitrate_kbps"]), reverse=True)
+    unique = []
+    seen = set()
+    for fmt in ordered:
+        key = (fmt["width"], fmt["height"], round(fmt["bitrate_kbps"]))
+        if key not in seen and _allowed_cdn(fmt["url"]):
+            seen.add(key)
+            unique.append(fmt)
+        if len(unique) >= 4:
+            break
+    checks = await asyncio.gather(*[
+        asyncio.to_thread(_probe_ytdlp_candidate, fmt) for fmt in unique
+    ])
+    return [fmt for fmt, ok in zip(unique, checks) if ok]
+
+
 @app.post("/api/download")
 async def download_video(data: VideoRequest):
     if not valid_tiktok_url(data.url):
@@ -289,24 +347,16 @@ async def download_video(data: VideoRequest):
     except Exception as exc:
         candidates = []
         diagnostic["yt_dlp"] = type(exc).__name__
+    # Only expose yt-dlp formats whose CDN responds with actual video bytes.
+    verified = await _verified_ytdlp_candidates(candidates)
+    diagnostic["yt_dlp_tested"] = f"{min(len(candidates), 4)}_candidatos"
+    diagnostic["yt_dlp_valid"] = f"{len(verified)}_links"
     links = []
-    seen = set()
-    for fmt in sorted(
-        candidates,
-        key=lambda f: (f["width"] * f["height"], f["bitrate_kbps"]),
-        reverse=True
-    ):
+    for fmt in verified:
         token = _make_token(fmt["url"], fmt["http_headers"])
         if not token:
             continue
-        key = (fmt["width"], fmt["height"], round(fmt["bitrate_kbps"]))
-        if key in seen:
-            continue
-        seen.add(key)
         width, height = fmt["width"], fmt["height"]
-        # Experimental direct CDN URL: the browser, not Render, requests the media.
-        # Keep the existing proxy as a separate fallback. URLs are short-lived and
-        # may require headers/cookies that browsers cannot supply.
         links.append({
             "url": fmt["url"],
             "label": f"yt-dlp direto • {width}x{height}" if width and height else "yt-dlp direto • qualidade não verificada",
@@ -314,7 +364,7 @@ async def download_video(data: VideoRequest):
             "height": height or None,
             "bitrate_kbps": fmt["bitrate_kbps"] or None,
             "quality_verified": bool(width and height),
-            "experimental": True,
+            "link_tested": True, "experimental": True,
         })
         links.append({
             "url": "/api/file?token=" + token,
@@ -323,9 +373,8 @@ async def download_video(data: VideoRequest):
             "height": height or None,
             "bitrate_kbps": fmt["bitrate_kbps"] or None,
             "quality_verified": bool(width and height),
+            "link_tested": True,
         })
-        if len(links) >= 12:
-            break
     # Direct links avoid Render proxy bandwidth and the CDN 403 seen in logs.
     direct_links, cobalt_result, tikwm_result = await asyncio.gather(
         _ssstik_fallback(data.url), _cobalt_fallback(data.url), _tikwm_fallback(data.url)
