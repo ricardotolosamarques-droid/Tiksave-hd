@@ -14,75 +14,74 @@ app = FastAPI(title="TikSave HD Backend", version="2.1")
 # Dicionário de tokens para o proxy (ajuste conforme a sua implementação atual)
 download_tokens = {}
 
+@app.get("/")
+def home():
+    return {"status": "online", "service": "TikSave HD", "version": "2.2"}
+
+
+def _site_extract_yt_dlp(url: str):
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    candidates = []
+    for fmt in (info.get("formats") or [info]):
+        if fmt.get("vcodec") == "none" or fmt.get("acodec") == "none":
+            continue
+        if fmt.get("ext") != "mp4" or not fmt.get("url"):
+            continue
+        candidates.append(fmt)
+    candidates.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+    if not candidates:
+        raise ValueError("yt-dlp não encontrou vídeo MP4 com áudio.")
+    return {"status": "ok", "source": "yt-dlp", "links": [
+        {"url": f["url"], "label": f"MP4 • {f.get('height') or '?'}p",
+         "source": "yt-dlp", "width": f.get("width"), "height": f.get("height"),
+         "bitrate_kbps": f.get("tbr"), "quality_verified": False}
+        for f in candidates[:4]]}
+
+
+def _site_extract_tikwm(url: str):
+    with httpx.Client(timeout=25) as client:
+        response = client.get("https://www.tikwm.com/api/", params={"url": url, "hd": 1})
+        response.raise_for_status()
+        payload = response.json()
+    data = payload.get("data") or {}
+    if payload.get("code") != 0 or not isinstance(data, dict):
+        raise ValueError("TikWM indisponível.")
+    links = []
+    for key, label in (("hdplay", "HD sem marca d'água"), ("play", "Sem marca d'água")):
+        media = data.get(key)
+        if media:
+            from urllib.parse import urljoin
+            media = urljoin("https://www.tikwm.com/", media)
+            if media.startswith("https://") and media not in [v["url"] for v in links]:
+                links.append({"url": media, "label": label, "source": "tikwm", "quality_verified": False})
+    if not links:
+        raise ValueError("TikWM não encontrou vídeo.")
+    return {"status": "ok", "source": "tikwm", "links": links}
+
+
 @app.post("/api/download")
 async def api_download(payload: dict):
-    url = payload.get("url")
-    if not url:
-        raise HTTPException(status_code=400, detail="URL não fornecida.")
-    
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-    }
-    
-    def extract():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
-            
+    url = payload.get("url", "")
     try:
-        info = await asyncio.to_thread(extract)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao extrair vídeo: {str(e)}")
-        
-    formats = []
-    for f in info.get('formats', []):
-        # BLOQUEIO DE ÁUDIO: Ignora formatos que possuem apenas áudio (sem vídeo)
-        if f.get('vcodec') == 'none':
-            continue
-            
-        formats.append({
-            "format_id": f.get("format_id"),
-            "ext": f.get("ext"),
-            "url": f.get("url"),
-            "resolution": f.get("resolution") or f"{f.get('width', 0)}x{f.get('height', 0)}"
-        })
-        
-    return {
-        "success": True,
-        "title": info.get("title"),
-        "formats": formats
-    }
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (host == "tiktok.com" or host.endswith(".tiktok.com")):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Insira um link HTTPS válido do TikTok.")
+    for extractor in (_site_extract_yt_dlp, _site_extract_tikwm):
+        try:
+            return await asyncio.to_thread(extractor, url)
+        except Exception as error:
+            print(f"Site {extractor.__name__} failed: {type(error).__name__}: {str(error)[:200]}")
+    raise HTTPException(status_code=502, detail="Não foi possível obter o vídeo. Tente novamente mais tarde.")
+
 
 @app.get("/api/file")
 async def proxy_file(token: str):
-    target_url = download_tokens.get(token)
-    if not target_url:
-        raise HTTPException(status_code=404, detail="Token inválido ou expirado.")
+    raise HTTPException(status_code=404, detail="Link de download expirado. Faça uma nova busca.")
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        try:
-            response = await client.get(target_url, headers={"Range": "bytes=0-1023"}, timeout=10.0)
-            content_type = response.headers.get("content-type", "").lower()
-            
-            # BLOQUEIO DE ÁUDIO NO PROXY: Rejeita se o Content-Type for de áudio
-            if "audio/" in content_type:
-                raise HTTPException(
-                    status_code=403, 
-                    detail="O descarregamento de ficheiros de áudio não é permitido."
-                )
-        except Exception as e:
-            if isinstance(e, HTTPException):
-                raise e
-            raise HTTPException(status_code=500, detail="Erro ao validar arquivo.")
-            
-    # Realiza o streaming do vídeo aprovado
-    async def stream_generator():
-        async with httpx.AsyncClient(follow_redirects=True) as c:
-            async with c.stream("GET", target_url) as r:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
-
-    return StreamingResponse(stream_generator(), media_type="video/mp4")
 
 @app.get("/api/highlights")
 async def get_highlights(username: str):
