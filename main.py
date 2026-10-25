@@ -533,8 +533,9 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
     message = data.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
-    message_text = message.get("text") or ""
+    message_text = message.get("text") or message.get("caption") or ""
     if not chat_id or not isinstance(message_text, str):
+        print("Telegram: update without supported text/caption", flush=True)
         return {"status": "ok"}
 
     if message_text.strip().startswith("/start"):
@@ -543,8 +544,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
     url, platform = _telegram_link_from_message(message_text)
     if not url:
+        print("Telegram: link not recognized; text_length=", len(message_text), flush=True)
+        await _telegram_send(chat_id, "Não reconheci o link. Envie o endereço completo de uma publicação pública (por exemplo, https://www.instagram.com/p/...).")
         return {"status": "ok"}
 
+    print("Telegram: recognized platform=", platform, flush=True)
     await _telegram_show_choices(chat_id, url, platform)
     return {"status": "ok"}
 
