@@ -291,6 +291,42 @@ async def _telegram_send(chat_id: int, message: str):
         response.raise_for_status()
 
 
+# Short opaque callback IDs avoid Telegram's 64-byte callback_data limit.
+telegram_choices = {}  # choice ID -> (chat ID, TikTok URL, expiry)
+TELEGRAM_CHOICE_TTL = 1800
+
+
+async def _telegram_show_choices(chat_id: int, url: str):
+    now = time.time()
+    for key, item in list(telegram_choices.items()):
+        if item[2] < now:
+            telegram_choices.pop(key, None)
+    choice_id = secrets.token_urlsafe(12)
+    telegram_choices[choice_id] = (chat_id, url, now + TELEGRAM_CHOICE_TTL)
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": "Escolha uma opção:",
+                "reply_markup": {"inline_keyboard": [[
+                    {"text": "TikWM", "callback_data": f"dl:tikwm:{choice_id}"},
+                    {"text": "Cobalt", "callback_data": f"dl:cobalt:{choice_id}"},
+                ]]},
+            },
+        )
+        response.raise_for_status()
+
+
+async def _telegram_answer_callback(callback_id: str, text: str = ""):
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text[:180]},
+        )
+        response.raise_for_status()
+
+
 TELEGRAM_MAX_VIDEO_BYTES = 45 * 1024 * 1024
 
 
@@ -433,10 +469,11 @@ def _telegram_download(url: str, folder: str):
     raise ValueError("Nenhuma fonte conseguiu obter um vídeo MP4 válido.")
 
 
-async def _telegram_process_video(chat_id: int, url: str):
+async def _telegram_process_video(chat_id: int, url: str, provider: str):
     try:
         with tempfile.TemporaryDirectory(prefix="tiksave_telegram_") as folder:
-            title, path = await asyncio.to_thread(_telegram_download, url, folder)
+            downloader = {"tikwm": _telegram_download_tikwm, "cobalt": _telegram_download_cobalt}[provider]
+            title, path = await asyncio.to_thread(downloader, url, folder)
             async with httpx.AsyncClient(timeout=120) as client:
                 with path.open("rb") as video:
                     response = await client.post(
@@ -462,6 +499,28 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Webhook não autorizado.")
     data = await request.json()
+    callback = data.get("callback_query")
+    if callback:
+        callback_id = callback.get("id")
+        callback_data = callback.get("data") or ""
+        callback_message = callback.get("message") or {}
+        chat_id = (callback_message.get("chat") or {}).get("id")
+        parts = callback_data.split(":")
+        if callback_id and len(parts) == 3 and parts[0] == "dl":
+            provider, choice_id = parts[1], parts[2]
+            choice = telegram_choices.get(choice_id)
+            if provider not in ("tikwm", "cobalt") or not choice or choice[0] != chat_id or choice[2] < time.time():
+                await _telegram_answer_callback(callback_id, "Opção expirada. Envie o link novamente.")
+                return {"status": "ok"}
+            # A choice can only be used once; prevent duplicate downloads.
+            telegram_choices.pop(choice_id, None)
+            await _telegram_answer_callback(callback_id, "Preparando seu vídeo...")
+            background_tasks.add_task(_telegram_process_video, chat_id, choice[1], provider)
+            return {"status": "ok"}
+        if callback_id:
+            await _telegram_answer_callback(callback_id, "Opção inválida.")
+        return {"status": "ok"}
+
     message = data.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
     message_text = message.get("text") or ""
@@ -469,14 +528,14 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"status": "ok"}
 
     if message_text.strip().startswith("/start"):
-        await _telegram_send(chat_id, "Olá! Envie um link do TikTok para receber uma opção de vídeo.")
+        await _telegram_send(chat_id, "Olá! Envie um link do TikTok e escolha entre TikWM e Cobalt.")
         return {"status": "ok"}
 
     url = _tiktok_link_from_message(message_text)
     if not url:
         return {"status": "ok"}
 
-    background_tasks.add_task(_telegram_process_video, chat_id, url)
+    await _telegram_show_choices(chat_id, url)
     return {"status": "ok"}
 
 
@@ -500,7 +559,7 @@ async def register_telegram_webhook():
                 json={
                     "url": webhook_url,
                     "secret_token": TELEGRAM_WEBHOOK_SECRET,
-                    "allowed_updates": ["message"],
+                    "allowed_updates": ["message", "callback_query"],
                 },
             )
             response.raise_for_status()
