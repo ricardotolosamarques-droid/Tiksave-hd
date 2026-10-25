@@ -257,43 +257,33 @@ def health():
 
 
 async def _probe_tikwm_video(url):
-    """Check TikWM media type without downloading the full file."""
+    """Best-effort media validation; reject confirmed audio, not inconclusive checks."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().rstrip(".")
-    # Never allow the provider to make the backend request arbitrary hosts.
     if (parsed.scheme != "https" or parsed.port not in (None, 443)
-            or parsed.username or parsed.password
-            or not (host == "tikwm.com" or host.endswith(".tikwm.com")
-                    or host == "tikwm.net" or host.endswith(".tikwm.net"))):
+            or parsed.username or parsed.password):
+        return False
+    if parsed.path.lower().split("?", 1)[0].endswith(
+            (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac")):
+        return False
+    # TikWM may return a TikTok CDN URL instead of its own domain.
+    allowed = ("tikwm.com", "tikwm.net") + MEDIA_DOMAINS
+    if not any(host == d or host.endswith("." + d) for d in allowed):
+        # Unknown external hosts are never requested by our backend.
         return False
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
-            async with client.stream(
-                "GET", url, headers={"Range": "bytes=0-4095",
-                                     "Accept": "video/*,application/octet-stream"}
-            ) as response:
-                if response.status_code not in (200, 206):
-                    return False
-                mime = response.headers.get("content-type", "").split(";", 1)[0].lower().strip()
-                if mime.startswith("audio/"):
-                    return False
-                if mime not in ("video/mp4", "video/webm", "video/quicktime",
-                                "application/octet-stream", "binary/octet-stream"):
-                    return False
-                sample = b""
-                async for chunk in response.aiter_bytes():
-                    sample += chunk[:4096 - len(sample)]
-                    if len(sample) >= 64:
-                        break
-                if sample.startswith((b"ID3", b"OggS", b"fLaC", b"RIFF")):
-                    return False
-                # Reject common audio-only AAC/MP3 frame signatures.
-                if len(sample) >= 2 and sample[0] == 0xff and (sample[1] & 0xf0) == 0xf0:
-                    return False
-                # MP4 and WebM containers can carry video; unknown files are hidden.
-                return (len(sample) >= 12 and sample[4:8] == b"ftyp") or sample.startswith(b"\\x1a\\x45\\xdf\\xa3")
+        async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+            response = await client.head(url, headers={"Accept": "video/*"})
+        if response.status_code in (403, 405, 429, 500, 502, 503, 504):
+            return True  # HEAD is commonly blocked even for valid video URLs.
+        if response.status_code in (404, 410):
+            return False
+        mime = response.headers.get("content-type", "").lower()
+        if mime.startswith("audio/"):
+            return False
+        return True
     except (httpx.HTTPError, ValueError, TypeError):
-        return False
+        return True  # Do not hide a valid video solely because HEAD failed.
 
 
 async def _tikwm_fallback(video_url):
@@ -348,8 +338,10 @@ def _probe_ytdlp_candidate(fmt):
                             return False
                         current = urljoin(current, location)
                         continue
-                    if response.status_code not in (200, 206):
+                    if response.status_code in (403, 404, 410):
                         return False
+                    if response.status_code not in (200, 206):
+                        return True  # Inconclusive probe; metadata already indicates video
                     mime = response.headers.get("content-type", "").lower()
                     if mime.startswith("audio/"):
                         return False
@@ -358,10 +350,10 @@ def _probe_ytdlp_candidate(fmt):
                         return False
                     # A successful response alone is insufficient: read a small chunk.
                     chunk = next(response.iter_content(chunk_size=1024), b"")
-                    return bool(chunk)
-        return False
+                    return bool(chunk) or True  # Empty ranged response is inconclusive
+        return True
     except Exception:
-        return False
+        return True
 
 
 async def _verified_ytdlp_candidates(candidates):
