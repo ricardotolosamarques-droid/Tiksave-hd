@@ -4,3 +4,4 @@ httpx
 beautifulsoup4
 yt-dlp[default]
 curl_cffi
+gallery-dl
