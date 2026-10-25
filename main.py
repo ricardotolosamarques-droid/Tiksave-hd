@@ -1,8 +1,10 @@
 import asyncio
 import os
 import re
+import tempfile
+from pathlib import Path
 from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
 import httpx
 import yt_dlp
@@ -146,36 +148,48 @@ async def _telegram_send(chat_id: int, message: str):
         response.raise_for_status()
 
 
-def _telegram_extract(url: str):
+def _telegram_download(url: str, folder: str):
+    """Download one MP4 video with audio; never choose audio-only formats."""
     opts = {
-        "quiet": True, "no_warnings": True, "skip_download": True,
-        "noplaylist": True, "socket_timeout": 15, "retries": 1,
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "socket_timeout": 20, "retries": 1,
+        "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none][ext=mp4]",
+        "outtmpl": str(Path(folder) / "video.%(ext)s"),
+        "max_filesize": 45 * 1024 * 1024,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    candidates = []
-    for fmt in (info or {}).get("formats") or [info]:
-        if not isinstance(fmt, dict):
-            continue
-        media_url = fmt.get("url")
-        if (not isinstance(media_url, str) or not media_url.startswith("https://")
-                or fmt.get("vcodec") in ("none", None)
-                or str(fmt.get("ext") or "").lower() in {"mp3", "m4a", "aac", "ogg", "opus"}):
-            continue
-        # Prefer a single playable video+audio stream when available.
-        candidates.append(fmt)
-    candidates.sort(key=lambda f: (
-        f.get("acodec") not in ("none", None),
-        int(f.get("height") or 0),
-        float(f.get("tbr") or 0),
-    ), reverse=True)
-    return (info or {}).get("title") or "Vídeo do TikTok", (
-        candidates[0].get("url") if candidates else None
-    )
+        info = ydl.extract_info(url, download=True)
+        path = Path(ydl.prepare_filename(info))
+    if not path.is_file() or path.suffix.lower() != ".mp4":
+        raise ValueError("Vídeo MP4 indisponível.")
+    if path.stat().st_size > 45 * 1024 * 1024:
+        raise ValueError("Vídeo excede o limite de envio.")
+    return (info or {}).get("title") or "Vídeo do TikTok", path
+
+
+async def _telegram_process_video(chat_id: int, url: str):
+    try:
+        with tempfile.TemporaryDirectory(prefix="tiksave_telegram_") as folder:
+            title, path = await asyncio.to_thread(_telegram_download, url, folder)
+            async with httpx.AsyncClient(timeout=120) as client:
+                with path.open("rb") as video:
+                    response = await client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
+                        data={"chat_id": str(chat_id), "caption": title[:900], "supports_streaming": "true"},
+                        files={"video": ("video.mp4", video, "video/mp4")},
+                    )
+                response.raise_for_status()
+                if not response.json().get("ok"):
+                    raise ValueError("Telegram recusou o envio.")
+    except Exception:
+        try:
+            await _telegram_send(chat_id, "Não consegui enviar esse vídeo. Pode estar indisponível, ser grande demais ou não ter um MP4 compatível.")
+        except Exception:
+            pass
 
 
 @app.post("/api/telegram-webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(status_code=503, detail="Bot do Telegram não configurado.")
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
@@ -195,14 +209,5 @@ async def telegram_webhook(request: Request):
     if not url:
         return {"status": "ok"}
 
-    await _telegram_send(chat_id, "Processando o link do TikTok...")
-    try:
-        title, video_url = await asyncio.to_thread(_telegram_extract, url)
-        if video_url:
-            # CDN links may expire; absence of watermark is not guaranteed.
-            await _telegram_send(chat_id, f"{title[:150]}\\n\\nLink do vídeo (temporário):\\n{video_url}")
-        else:
-            await _telegram_send(chat_id, "Não encontrei um formato de vídeo válido para esse link.")
-    except Exception:
-        await _telegram_send(chat_id, "Não foi possível processar esse vídeo agora.")
+    background_tasks.add_task(_telegram_process_video, chat_id, url)
     return {"status": "ok"}
