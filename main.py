@@ -374,19 +374,24 @@ def _telegram_download_parth_dl(url: str, folder: str):
         result = subprocess.run(command, capture_output=True, text=True, timeout=100, check=False, cwd=str(output_dir))
     except subprocess.TimeoutExpired as error:
         raise ValueError("parth-dl excedeu o tempo limite.") from error
-    videos = sorted((p for p in output_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".mp4"), key=lambda p: p.stat().st_size, reverse=True)
-    if not videos:
+    media = sorted((p for p in output_dir.rglob("*") if p.is_file() and p.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png")), key=lambda p: str(p))
+    if not media:
         print(f"Telegram parth-dl failed: exit={result.returncode}; {(result.stderr or result.stdout)[-300:]}", flush=True)
-        raise ValueError("parth-dl não conseguiu obter vídeo público.")
-    video = videos[0]
-    if video.stat().st_size > TELEGRAM_MAX_VIDEO_BYTES:
-        raise ValueError("Vídeo excede 45 MB.")
-    if video.stat().st_size < 1024:
-        raise ValueError("parth-dl retornou arquivo vazio.")
-    with video.open("rb") as file:
-        if b"ftyp" not in file.read(16):
-            raise ValueError("parth-dl retornou arquivo que não é MP4.")
-    return "Vídeo do Instagram • parth-dl", video
+        raise ValueError("parth-dl não conseguiu obter mídia pública.")
+    if len(media) > 10:
+        raise ValueError("Álbum com mais de 10 arquivos não suportado.")
+    for item in media:
+        if not 1024 <= item.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES:
+            raise ValueError("Mídia vazia ou excede 45 MB.")
+        with item.open("rb") as f:
+            signature = f.read(16)
+        if item.suffix.lower() == ".mp4" and b"ftyp" not in signature:
+            raise ValueError("Arquivo MP4 inválido.")
+        if item.suffix.lower() in (".jpg", ".jpeg") and signature[:2] != bytes([255, 216]):
+            raise ValueError("Arquivo JPEG inválido.")
+        if item.suffix.lower() == ".png" and signature[:4] != bytes([137, 80, 78, 71]):
+            raise ValueError("Arquivo PNG inválido.")
+    return "Instagram • parth-dl", media if len(media) > 1 else media[0]
 
 
 def _telegram_download_gallery_dl(url: str, folder: str):
@@ -575,16 +580,40 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                     if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
                         raise ValueError("O YouTube está exigindo verificação ou login do servidor; Cobalt e yt-dlp falharam.") from fallback_error
                     raise ValueError("Nenhum extrator conseguiu acessar o vídeo.") from fallback_error
+            import mimetypes
+            from contextlib import ExitStack
+            media_paths = path if isinstance(path, list) else [path]
             async with httpx.AsyncClient(timeout=120) as client:
-                with path.open("rb") as video:
-                    response = await client.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo",
-                        data={"chat_id": str(chat_id), "caption": title[:900], "supports_streaming": "true"},
-                        files={"video": ("video.mp4", video, "video/mp4")},
-                    )
+                if len(media_paths) == 1:
+                    item = media_paths[0]
+                    is_video = item.suffix.lower() == ".mp4"
+                    method = "sendVideo" if is_video else "sendPhoto"
+                    field = "video" if is_video else "photo"
+                    with item.open("rb") as media_file:
+                        response = await client.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                            data={"chat_id": str(chat_id), "caption": title[:900]},
+                            files={field: (item.name, media_file, mimetypes.guess_type(item.name)[0] or "application/octet-stream")},
+                        )
+                else:
+                    import json
+                    with ExitStack() as stack:
+                        files = {}
+                        entries = []
+                        for index, item in enumerate(media_paths):
+                            key = f"media{index}"
+                            is_video = item.suffix.lower() == ".mp4"
+                            entries.append({"type": "video" if is_video else "photo", "media": f"attach://{key}", **({"caption": title[:900]} if index == 0 else {})})
+                            files[key] = (item.name, stack.enter_context(item.open("rb")), mimetypes.guess_type(item.name)[0] or "application/octet-stream")
+                        response = await client.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
+                            data={"chat_id": str(chat_id), "media": json.dumps(entries)},
+                            files=files,
+                        )
                 response.raise_for_status()
                 if not response.json().get("ok"):
                     raise ValueError("Telegram recusou o envio.")
+
     except Exception as error:
         print(f"Telegram send failed: {type(error).__name__}: {str(error)[:250]}")
         try:
