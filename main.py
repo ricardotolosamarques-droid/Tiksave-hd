@@ -381,6 +381,8 @@ def _telegram_download_gallery_dl(url: str, folder: str):
     videos = sorted((p for p in output_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".mp4"), key=lambda p: p.stat().st_size, reverse=True)
     if not videos:
         print(f"Telegram Instagram gallery-dl failed: exit={result.returncode}; {(result.stderr or result.stdout)[-350:]}", flush=True)
+        if "redirect to login" in (result.stderr or "").lower() or "accounts/login" in (result.stderr or "").lower():
+            raise ValueError("Instagram exige login para acessar este conteúdo pelo servidor.")
         raise ValueError("gallery-dl não encontrou vídeo MP4 público.")
     video = videos[0]
     if video.stat().st_size > TELEGRAM_MAX_VIDEO_BYTES:
@@ -536,6 +538,10 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                         title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                 except Exception as fallback_error:
                     print(f"Telegram alternative download failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
+                    if host == "instagram.com" or host.endswith(".instagram.com"):
+                        raise ValueError("O Instagram está bloqueando o acesso automático do servidor. Cobalt, gallery-dl e yt-dlp não conseguiram extrair o vídeo.") from fallback_error
+                    if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
+                        raise ValueError("O YouTube está exigindo verificação ou login do servidor; Cobalt e yt-dlp falharam.") from fallback_error
                     raise ValueError("Nenhum extrator conseguiu acessar o vídeo.") from fallback_error
             async with httpx.AsyncClient(timeout=120) as client:
                 with path.open("rb") as video:
@@ -550,7 +556,16 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
     except Exception as error:
         print(f"Telegram send failed: {type(error).__name__}: {str(error)[:250]}")
         try:
-            await _telegram_send(chat_id, ("O Cobalt recusou esse link ou não conseguiu acessar a publicação do Instagram. Não é necessariamente limite de 45 MB." if provider == "cobalt" and ("Cobalt recusou" in str(error) or "400 Bad Request" in str(error)) else "Não consegui enviar esse vídeo. A fonte pode estar indisponível, o formato pode não ser compatível ou o arquivo pode ultrapassar 45 MB."))
+            message = str(error)
+            if "Instagram está bloqueando" in message:
+                reply = "O Instagram está exigindo login ou bloqueando o acesso do servidor. Testei Cobalt, gallery-dl e yt-dlp, mas nenhum conseguiu obter esse vídeo. Não é um problema de 45 MB."
+            elif "YouTube está exigindo" in message:
+                reply = "O YouTube está exigindo verificação/login do servidor. Cobalt e yt-dlp falharam; não é um problema de 45 MB."
+            elif "excede 45 MB" in message:
+                reply = "O vídeo ultrapassa o limite de 45 MB configurado neste bot."
+            else:
+                reply = "Não consegui obter esse vídeo. A fonte pode estar indisponível ou exigir autenticação."
+            await _telegram_send(chat_id, reply)
         except Exception:
             pass
 
