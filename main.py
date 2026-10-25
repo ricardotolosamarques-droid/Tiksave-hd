@@ -773,12 +773,40 @@ async def _diagnose_invidious_youtube_once():
             print(f"YouTube Invidious diagnostic: host={host} error={type(error).__name__}: {str(error)[:120]}", flush=True)
 
 
+async def _diagnose_piped_youtube_once():
+    """One-off metadata-only probe for public Piped API instances; never downloads files."""
+    video_id = "YefI9Vz7ET0"
+    instances = (
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://api.piped.yt",
+    )
+    async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+        for base in instances:
+            try:
+                response = await client.get(f"{base}/streams/{video_id}")
+                payload = response.json() if response.status_code == 200 else {}
+                streams = payload.get("videoStreams") or [] if isinstance(payload, dict) else []
+                playable = sum(
+                    1 for stream in streams
+                    if isinstance(stream, dict)
+                    and stream.get("mimeType") == "video/mp4"
+                    and not stream.get("videoOnly", True)
+                    and isinstance(stream.get("url"), str)
+                    and stream["url"].startswith("https://")
+                )
+                print(f"YouTube Piped diagnostic: instance={base} status={response.status_code} video_streams={len(streams)} muxed_mp4={playable}", flush=True)
+            except Exception as error:
+                print(f"YouTube Piped diagnostic: instance={base} error={type(error).__name__}: {str(error)[:100]}", flush=True)
+
+
 @app.on_event("startup")
 async def register_telegram_webhook():
     """Register webhook using Render environment secrets, without exposing them in a URL."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
         print("Telegram webhook: credentials not configured; skipping registration.")
         return
+    asyncio.create_task(_diagnose_piped_youtube_once())
     webhook_url = os.getenv(
         "TELEGRAM_WEBHOOK_URL",
         "https://tiksave-hd-1.onrender.com/api/telegram-webhook",
