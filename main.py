@@ -211,3 +211,35 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_telegram_process_video, chat_id, url)
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+async def register_telegram_webhook():
+    """Register webhook using Render environment secrets, without exposing them in a URL."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
+        print("Telegram webhook: credentials not configured; skipping registration.")
+        return
+    webhook_url = os.getenv(
+        "TELEGRAM_WEBHOOK_URL",
+        "https://tiksave-hd-1.onrender.com/api/telegram-webhook",
+    ).strip()
+    if not webhook_url.startswith("https://"):
+        print("Telegram webhook: invalid HTTPS URL.")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+                json={
+                    "url": webhook_url,
+                    "secret_token": TELEGRAM_WEBHOOK_SECRET,
+                    "allowed_updates": ["message"],
+                },
+            )
+            response.raise_for_status()
+            if response.json().get("ok"):
+                print("Telegram webhook registered successfully.")
+            else:
+                print("Telegram webhook registration rejected by Telegram.")
+    except Exception as exc:
+        print(f"Telegram webhook registration failed: {type(exc).__name__}")
