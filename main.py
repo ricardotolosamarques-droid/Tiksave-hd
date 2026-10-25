@@ -768,10 +768,43 @@ async def _diagnose_invidious_youtube_once():
             print(f"YouTube Invidious diagnostic: host={host} error={type(error).__name__}: {str(error)[:120]}", flush=True)
 
 
+async def _diagnose_youtubejs_once():
+    """One-shot isolated YouTube.js diagnostic; never changes Telegram downloads."""
+    import shutil
+    import subprocess
+
+    def run_probe():
+        node = shutil.which("node")
+        npm = shutil.which("npm")
+        if not node or not npm:
+            print(f"YouTube.js diagnostic: unavailable node={bool(node)} npm={bool(npm)}", flush=True)
+            return
+        try:
+            with tempfile.TemporaryDirectory(prefix="youtubejs_probe_") as directory:
+                import shutil as file_ops
+                file_ops.copyfile(str(Path(__file__).with_name("youtubejs_probe.mjs")), str(Path(directory) / "youtubejs_probe.mjs"))
+                installed = subprocess.run(
+                    [npm, "install", "--no-audit", "--no-fund", "--silent", "youtubei.js"],
+                    cwd=directory, capture_output=True, text=True, timeout=90,
+                )
+                if installed.returncode:
+                    print(f"YouTube.js diagnostic: npm_install_failed code={installed.returncode} detail={installed.stderr[-220:]}", flush=True)
+                    return
+                tested = subprocess.run(
+                    [node, "youtubejs_probe.mjs"], cwd=directory,
+                    capture_output=True, text=True, timeout=55,
+                )
+                print(f"YouTube.js diagnostic: exit={tested.returncode} output={(tested.stdout or tested.stderr)[-550:]}", flush=True)
+        except Exception as error:
+            print(f"YouTube.js diagnostic: error={type(error).__name__}: {str(error)[:180]}", flush=True)
+
+    await asyncio.to_thread(run_probe)
+
+
 @app.on_event("startup")
 async def register_telegram_webhook():
     """Register webhook using Render environment secrets, without exposing them in a URL."""
-    asyncio.create_task(_diagnose_invidious_youtube_once())
+    asyncio.create_task(_diagnose_youtubejs_once())
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
         print("Telegram webhook: credentials not configured; skipping registration.")
         return
