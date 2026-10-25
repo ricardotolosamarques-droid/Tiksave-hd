@@ -118,6 +118,15 @@ def _extract_ytdlp(url):
             continue
         if fmt.get("acodec") == "none":
             continue
+        # Exclude audio-only formats, even when codec metadata is incomplete.
+        extension = str(fmt.get("ext") or "").lower()
+        mime_hint = str(fmt.get("mime_type") or "").lower()
+        format_note = str(fmt.get("format_note") or "").lower()
+        if (extension in {"mp3", "m4a", "aac", "opus", "ogg", "oga", "wav", "flac"}
+                or mime_hint.startswith("audio/")
+                or "audio only" in format_note
+                or "audio_only" in str(fmt.get("format_id") or "").lower()):
+            continue
         if fmt.get("protocol") not in (None, "http", "https"):
             continue
         out.append({
@@ -301,6 +310,8 @@ def _probe_ytdlp_candidate(fmt):
                     if response.status_code not in (200, 206):
                         return False
                     mime = response.headers.get("content-type", "").lower()
+                    if mime.startswith("audio/"):
+                        return False
                     if not (mime.startswith("video/") or
                             mime.startswith("application/octet-stream")):
                         return False
