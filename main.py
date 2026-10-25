@@ -256,34 +256,52 @@ def health():
     return {"status": "online", "service": "TikSave HD", "version": "3.2.2"}
 
 
+def _video_signature(data):
+    """Require evidence of a video track, not merely an MP4 audio container."""
+    if len(data) < 16:
+        return False
+    if data.startswith((b"ID3", b"OggS", b"fLaC", b"RIFF")):
+        return False
+    if data[4:8] == b"ftyp":
+        # MP4/M4A share ftyp. A 'vide' handler proves a video track.
+        return b"hdlr" in data and b"vide" in data
+    if data.startswith(bytes.fromhex("1a45dfa3")):
+        return b"V_VP8" in data or b"V_VP9" in data or b"V_AV1" in data
+    return False
+
+
 async def _probe_tikwm_video(url):
-    """Best-effort media validation; reject confirmed audio, not inconclusive checks."""
+    """Only show TikWM media if a small ranged download proves a video track."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().rstrip(".")
     if (parsed.scheme != "https" or parsed.port not in (None, 443)
             or parsed.username or parsed.password):
         return False
-    if parsed.path.lower().split("?", 1)[0].endswith(
-            (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac")):
+    if parsed.path.lower().endswith((".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac")):
         return False
-    # TikWM may return a TikTok CDN URL instead of its own domain.
     allowed = ("tikwm.com", "tikwm.net") + MEDIA_DOMAINS
-    if not any(host == d or host.endswith("." + d) for d in allowed):
-        # Unknown external hosts are never requested by our backend.
+    if not any(host == domain or host.endswith("." + domain) for domain in allowed):
         return False
     try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
-            response = await client.head(url, headers={"Accept": "video/*"})
-        if response.status_code in (403, 405, 429, 500, 502, 503, 504):
-            return True  # HEAD is commonly blocked even for valid video URLs.
-        if response.status_code in (404, 410):
-            return False
-        mime = response.headers.get("content-type", "").lower()
-        if mime.startswith("audio/"):
-            return False
-        return True
+        async with httpx.AsyncClient(timeout=9, follow_redirects=False) as client:
+            async with client.stream("GET", url, headers={"Range": "bytes=0-262143",
+                            "Accept": "video/*,application/octet-stream"}) as response:
+                if response.status_code not in (200, 206):
+                    return False
+                mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                if mime.startswith("audio/") or mime.startswith("text/"):
+                    return False
+                if mime not in ("video/mp4", "video/webm", "application/octet-stream",
+                                "binary/octet-stream"):
+                    return False
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    data.extend(chunk[:262144 - len(data)])
+                    if len(data) >= 262144:
+                        break
+                return _video_signature(bytes(data))
     except (httpx.HTTPError, ValueError, TypeError):
-        return True  # Do not hide a valid video solely because HEAD failed.
+        return False
 
 
 async def _tikwm_fallback(video_url):
@@ -314,7 +332,7 @@ async def _tikwm_fallback(video_url):
 
 
 def _probe_ytdlp_candidate(fmt):
-    """Check CDN accessibility with a tiny ranged request, never downloading the full video."""
+    """Strict check: accessible media with an identifiable video track."""
     from curl_cffi import requests as curl_requests
     target = fmt["url"]
     if not _allowed_cdn(target) or not _public_dns(urlparse(target).hostname):
@@ -322,7 +340,7 @@ def _probe_ytdlp_candidate(fmt):
     allowed = {"user-agent", "referer", "origin", "accept", "accept-language"}
     headers = {k: v for k, v in fmt.get("http_headers", {}).items()
                if isinstance(k, str) and isinstance(v, str) and k.lower() in allowed}
-    headers["Range"] = "bytes=0-1023"
+    headers["Range"] = "bytes=0-262143"
     headers.setdefault("Accept", "video/mp4,*/*")
     try:
         with curl_requests.Session(impersonate="chrome") as session:
@@ -331,29 +349,29 @@ def _probe_ytdlp_candidate(fmt):
                 if not _allowed_cdn(current) or not _public_dns(urlparse(current).hostname):
                     return False
                 with session.get(current, headers=headers, stream=True,
-                                 allow_redirects=False, timeout=7) as response:
+                                 allow_redirects=False, timeout=9) as response:
                     if response.status_code in (301, 302, 303, 307, 308):
                         location = response.headers.get("location")
                         if not location:
                             return False
                         current = urljoin(current, location)
                         continue
-                    if response.status_code in (403, 404, 410):
-                        return False
                     if response.status_code not in (200, 206):
-                        return True  # Inconclusive probe; metadata already indicates video
-                    mime = response.headers.get("content-type", "").lower()
-                    if mime.startswith("audio/"):
                         return False
-                    if not (mime.startswith("video/") or
-                            mime.startswith("application/octet-stream")):
+                    mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    if mime.startswith(("audio/", "text/")) or mime not in (
+                            "video/mp4", "video/webm", "application/octet-stream",
+                            "binary/octet-stream"):
                         return False
-                    # A successful response alone is insufficient: read a small chunk.
-                    chunk = next(response.iter_content(chunk_size=1024), b"")
-                    return True  # A valid video MIME is enough for this lightweight check
-        return True
+                    data = bytearray()
+                    for chunk in response.iter_content(chunk_size=16384):
+                        data.extend(chunk[:262144 - len(data)])
+                        if len(data) >= 262144:
+                            break
+                    return _video_signature(bytes(data))
+        return False
     except Exception:
-        return True
+        return False
 
 
 async def _verified_ytdlp_candidates(candidates):
