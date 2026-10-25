@@ -363,6 +363,41 @@ def _telegram_download_yt_dlp(url: str, folder: str):
 
 
 
+def _telegram_download_youtube_clients(url: str, folder: str):
+    """Try alternate public YouTube player clients without login or cookies.
+
+    This is a best-effort fallback; it cannot overcome server-side IP verification.
+    """
+    last_error = None
+    for client in ("android_vr", "web_safari"):
+        try:
+            target = Path(folder) / ("youtube_" + client)
+            target.mkdir(parents=True, exist_ok=True)
+            options = {
+                "quiet": True, "no_warnings": True, "noplaylist": True,
+                "socket_timeout": 20, "retries": 1,
+                "extractor_args": {"youtube": {"player_client": [client]}},
+                "format": "best[ext=mp4][vcodec!=none][acodec!=none]",
+                "outtmpl": str(target / "video.%(ext)s"),
+                "max_filesize": TELEGRAM_MAX_VIDEO_BYTES,
+            }
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=True)
+                path = Path(ydl.prepare_filename(info))
+            if not path.is_file() or path.suffix.lower() != ".mp4":
+                raise ValueError("Cliente YouTube não retornou MP4.")
+            if not 1024 <= path.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES:
+                raise ValueError("Arquivo fora do limite de 45 MB.")
+            with path.open("rb") as media:
+                if b"ftyp" not in media.read(16):
+                    raise ValueError("Arquivo não é MP4.")
+            return (info or {}).get("title") or "Vídeo do YouTube", path
+        except Exception as error:
+            last_error = error
+            print(f"Telegram YouTube client {client} failed: {type(error).__name__}: {str(error)[:180]}", flush=True)
+    raise ValueError("Clientes alternativos do YouTube indisponíveis.") from last_error
+
+
 def _telegram_download_pytubefix(url: str, folder: str):
     """Try public YouTube video with pytubefix, without account authentication."""
     from pytubefix import YouTube
@@ -602,9 +637,15 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                             title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                         except Exception as youtube_yt_error:
                             print(f"Telegram YouTube yt-dlp failed: {type(youtube_yt_error).__name__}: {str(youtube_yt_error)[:180]}", flush=True)
-                            title, path = await asyncio.wait_for(
-                                asyncio.to_thread(_telegram_download_pytubefix, url, folder), timeout=100
-                            )
+                            try:
+                                title, path = await asyncio.wait_for(
+                                    asyncio.to_thread(_telegram_download_youtube_clients, url, folder), timeout=100
+                                )
+                            except Exception as client_error:
+                                print(f"Telegram YouTube alternate clients failed: {type(client_error).__name__}", flush=True)
+                                title, path = await asyncio.wait_for(
+                                    asyncio.to_thread(_telegram_download_pytubefix, url, folder), timeout=100
+                                )
                 except Exception as fallback_error:
                     print(f"Telegram alternative download failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
                     if host == "instagram.com" or host.endswith(".instagram.com"):
