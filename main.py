@@ -755,9 +755,23 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok"}
 
 
+async def _diagnose_invidious_youtube_once():
+    """Temporary startup connectivity diagnostic; does not fetch video files."""
+    for host in ("https://yewtu.be", "https://inv.nadeko.net", "https://invidious.nerdvpn.de"):
+        try:
+            async with httpx.AsyncClient(timeout=9, follow_redirects=False) as client:
+                response = await client.get(host + "/api/v1/videos/YefI9Vz7ET0")
+            payload = response.json() if response.status_code == 200 else {}
+            formats = payload.get("formatStreams") or [] if isinstance(payload, dict) else []
+            print(f"YouTube Invidious diagnostic: host={host} status={response.status_code} formats={len(formats)}", flush=True)
+        except Exception as error:
+            print(f"YouTube Invidious diagnostic: host={host} error={type(error).__name__}: {str(error)[:120]}", flush=True)
+
+
 @app.on_event("startup")
 async def register_telegram_webhook():
     """Register webhook using Render environment secrets, without exposing them in a URL."""
+    asyncio.create_task(_diagnose_invidious_youtube_once())
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
         print("Telegram webhook: credentials not configured; skipping registration.")
         return
