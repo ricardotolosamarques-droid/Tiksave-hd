@@ -349,6 +349,8 @@ def _telegram_download_yt_dlp(url: str, folder: str):
         "format": "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none][ext=mp4]",
         "outtmpl": str(Path(folder) / "video.%(ext)s"),
         "max_filesize": TELEGRAM_MAX_VIDEO_BYTES,
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -377,6 +379,8 @@ def _telegram_download_youtube_clients(url: str, folder: str):
                 "quiet": True, "no_warnings": True, "noplaylist": True,
                 "socket_timeout": 20, "retries": 1,
                 "extractor_args": {"youtube": {"player_client": [client]}},
+                "js_runtimes": {"node": {}},
+                "remote_components": ["ejs:github"],
                 "format": "best[ext=mp4][vcodec!=none][acodec!=none]",
                 "outtmpl": str(target / "video.%(ext)s"),
                 "max_filesize": TELEGRAM_MAX_VIDEO_BYTES,
@@ -774,27 +778,6 @@ async def _diagnose_invidious_youtube_once():
 
 
 async def _diagnose_ytdlp_runtime_once():
-    """Report installed JS runtimes and yt-dlp version, without changing downloads."""
-    import shutil
-    import subprocess
-    for binary in ("deno", "node", "bun", "qjs"):
-        executable = shutil.which(binary)
-        if not executable:
-            print(f"YouTube runtime diagnostic: {binary}=missing", flush=True)
-            continue
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run, [executable, "--version"],
-                capture_output=True, text=True, timeout=5, check=False
-            )
-            version = (result.stdout or result.stderr).strip().splitlines()
-            print(f"YouTube runtime diagnostic: {binary}=present version={(version[0] if version else 'unknown')[:90]}", flush=True)
-        except Exception as error:
-            print(f"YouTube runtime diagnostic: {binary}=present check_error={type(error).__name__}", flush=True)
-    print(f"YouTube runtime diagnostic: yt_dlp_version={yt_dlp.version.__version__}", flush=True)
-
-
-async def _diagnose_ytdlp_runtime_once():
     """Inspect available JS runtimes and yt-dlp version without downloading media."""
     import shutil
     import subprocess
@@ -814,6 +797,25 @@ async def _diagnose_ytdlp_runtime_once():
         except Exception as error:
             print(f"YouTube runtime diagnostic: {name}=present error={type(error).__name__}", flush=True)
     print(f"YouTube runtime diagnostic: yt_dlp={yt_dlp.version.__version__} python={sys.version.split()[0]}", flush=True)
+
+
+async def _diagnose_youtube_node_once():
+    """Metadata-only YouTube extraction probe using the installed Node.js runtime."""
+    def probe():
+        options = {
+            "quiet": True, "no_warnings": False, "skip_download": True,
+            "noplaylist": True, "socket_timeout": 15, "retries": 0,
+            "js_runtimes": {"node": {}},
+            "remote_components": ["ejs:github"],
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info("https://www.youtube.com/watch?v=YefI9Vz7ET0", download=False)
+            return len((info or {}).get("formats") or [])
+    try:
+        formats = await asyncio.wait_for(asyncio.to_thread(probe), timeout=65)
+        print(f"YouTube Node diagnostic: success formats={formats}", flush=True)
+    except Exception as error:
+        print(f"YouTube Node diagnostic: failed {type(error).__name__}: {str(error)[:240]}", flush=True)
 
 
 async def _diagnose_piped_youtube_once():
@@ -849,9 +851,8 @@ async def register_telegram_webhook():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
         print("Telegram webhook: credentials not configured; skipping registration.")
         return
-    asyncio.create_task(_diagnose_piped_youtube_once())
     asyncio.create_task(_diagnose_ytdlp_runtime_once())
-    asyncio.create_task(_diagnose_ytdlp_runtime_once())
+    asyncio.create_task(_diagnose_youtube_node_once())
     webhook_url = os.getenv(
         "TELEGRAM_WEBHOOK_URL",
         "https://tiksave-hd-1.onrender.com/api/telegram-webhook",
