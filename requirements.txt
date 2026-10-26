@@ -7,3 +7,4 @@ curl_cffi
 gallery-dl
 parth-dl
 pytubefix==11.2.1
+git+https://github.com/bajaam/tt-dlp.git
