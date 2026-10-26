@@ -478,7 +478,7 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
             if not isinstance(video, dict):
                 continue
             video_id = str(video.get("video_id") or video.get("id") or "")
-            if not re.fullmatch(r"\\d{10,25}", video_id):
+            if not re.fullmatch(r"[0-9]{10,25}", video_id):
                 continue
             desc = " ".join(str(video.get("title") or "Sem descrição").split())[:90]
             lines.append(f"{i}. {desc}")
@@ -502,7 +502,7 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
         async with httpx.AsyncClient(timeout=20) as client:
             result = await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": "\\n".join(lines)[:4000],
+                json={"chat_id": chat_id, "text": "\n".join(lines)[:4000],
                       "reply_markup": {"inline_keyboard": keyboard},
                       "disable_web_page_preview": True},
             )
