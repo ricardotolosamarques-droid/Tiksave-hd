@@ -965,28 +965,41 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
 
 
 def _telegram_instagram_stories_fetch(username: str, folder: str):
-    """Best-effort retrieval of currently accessible public Stories, without login."""
+    """Try the dedicated Stories extractor, then the profile extractor, without bypassing login."""
     import subprocess
     import sys
     destination = Path(folder) / "stories"
     destination.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "gallery_dl", "--directory", str(destination),
-           "--option", "extractor.instagram.include=stories",
-           "--range", "1-30", f"https://www.instagram.com/{username}/"]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
-    except subprocess.TimeoutExpired as exc:
-        raise ValueError("Tempo limite ao consultar Stories.") from exc
-    media = sorted((p for p in destination.rglob("*") if p.is_file() and p.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png")))
-    if not media:
+    attempts = [
+        ("stories", f"https://www.instagram.com/stories/{username}/"),
+        ("profile", f"https://www.instagram.com/{username}/"),
+    ]
+    diagnostics = []
+    for kind, url in attempts:
+        cmd = [sys.executable, "-m", "gallery_dl", "--directory", str(destination),
+               "--range", "1-30", "--retries", "0"]
+        if kind == "profile":
+            cmd += ["--option", "extractor.instagram.include=stories"]
+        cmd.append(url)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90, check=False)
+        except subprocess.TimeoutExpired:
+            diagnostics.append(f"{kind}: timeout")
+            continue
+        media = sorted((p for p in destination.rglob("*") if p.is_file() and p.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png")))
+        media = [p for p in media if 1024 <= p.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES]
+        if media:
+            return media[:30]
         diagnostic = (proc.stderr or proc.stdout or "")[-350:]
-        print(f"Instagram stories @{username}: gallery-dl exit={proc.returncode} {diagnostic}", flush=True)
-        if "NotFoundError" in diagnostic or "KeyError" in diagnostic:
-            raise ValueError("O Instagram recusou a consulta do perfil pelo extrator; não significa que o usuário não exista.")
-        if "login" in diagnostic.lower() or "authentication" in diagnostic.lower():
-            raise ValueError("O Instagram exige autenticação para consultar esses Stories.")
-        raise ValueError("Não foram encontrados Stories acessíveis nessa consulta.")
-    return [p for p in media[:30] if 1024 <= p.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES]
+        print(f"Instagram stories @{username} ({kind}): gallery-dl exit={proc.returncode} {diagnostic}", flush=True)
+        diagnostics.append(diagnostic)
+        lower = diagnostic.lower()
+        if any(v in lower for v in ("authrequired", "login required", "authentication required", "cookies needed", "401 unauthorized", "429 too many requests")):
+            raise ValueError("O Instagram exige autenticação ou limitou o acesso; não é possível obter esses Stories sem permissão.")
+    combined = " ".join(diagnostics).lower()
+    if "notfounderror" in combined or "keyerror" in combined:
+        raise ValueError("O Instagram não disponibilizou os dados dos Stories aos extratores; isso não significa que o perfil não exista.")
+    raise ValueError("Não foram encontrados Stories acessíveis nessa consulta.")
 
 
 async def _telegram_show_instagram_stories(chat_id: int, username: str):
