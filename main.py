@@ -402,6 +402,35 @@ async def _telegram_profile_tikhub(username: str, cursor: int = 0):
             "hasMore": data.get("has_more") or data.get("hasMore")}
 
 
+def _telegram_profile_ttdlp(username: str, cursor: int = 0):
+    """Scan public profile using tt-dlp dry-run, never downloading media."""
+    import subprocess
+    import sys
+    with tempfile.TemporaryDirectory(prefix="ttdlp_profile_") as folder:
+        command = [sys.executable, "-m", "tt_dlp", "--dry-run", "--no-stories",
+                   "--limit", str(min(cursor + 10, 40)), "--output", folder,
+                   "--profile-store", os.path.join(folder, "profiles.json"),
+                   f"@{username}"]
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=65, cwd=folder, check=False)
+    print(f"TikTok tt-dlp exit={result.returncode}; output={result.stdout[-450:]!r}; error={result.stderr[-250:]!r}", flush=True)
+    if result.returncode:
+        raise RuntimeError("tt-dlp profile scan failed")
+    items = []
+    seen = set()
+    for line in result.stdout.splitlines():
+        if not line.startswith("[dry-run] "):
+            continue
+        filename = line[len("[dry-run] "):]
+        match = re.match(r"^([0-9]{10,25})(?:[_ ]|\\.)", filename)
+        if not match or match.group(1) in seen:
+            continue
+        seen.add(match.group(1))
+        items.append({"id": match.group(1), "title": filename[len(match.group(1)):].strip(" _")[:90]})
+    return {"videos": items[cursor:cursor + 10], "cursor": cursor + 10,
+            "hasMore": len(items) > cursor + 10}
+
+
 async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int = 0):
     try:
         try:
@@ -429,10 +458,17 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
                     )
                     videos = data["videos"]
             else:
-                data = await asyncio.wait_for(
-                    asyncio.to_thread(_telegram_profile_ytdlp, username, cursor), timeout=45
-                )
-                videos = data["videos"]
+                try:
+                    data = await asyncio.wait_for(
+                        asyncio.to_thread(_telegram_profile_ttdlp, username, cursor), timeout=75
+                    )
+                    videos = data["videos"]
+                except Exception as ttdlp_exc:
+                    print(f"TikTok profile tt-dlp unavailable: {type(ttdlp_exc).__name__}: {str(ttdlp_exc)[:100]}", flush=True)
+                    data = await asyncio.wait_for(
+                        asyncio.to_thread(_telegram_profile_ytdlp, username, cursor), timeout=45
+                    )
+                    videos = data["videos"]
         if not videos:
             await _telegram_send(chat_id, "Nenhum post público encontrado para esse perfil.")
             return
