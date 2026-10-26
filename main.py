@@ -964,6 +964,56 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
             pass
 
 
+def _telegram_instagram_stories_fetch(username: str, folder: str):
+    """Best-effort retrieval of currently accessible public Stories, without login."""
+    import subprocess
+    import sys
+    destination = Path(folder) / "stories"
+    destination.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "gallery_dl", "--directory", str(destination),
+           "--range", "1-30", f"https://www.instagram.com/stories/{username}/"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("Tempo limite ao consultar Stories.") from exc
+    media = sorted((p for p in destination.rglob("*") if p.is_file() and p.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png")))
+    if not media:
+        diagnostic = (proc.stderr or proc.stdout or "")[-350:]
+        print(f"Instagram stories @{username}: gallery-dl exit={proc.returncode} {diagnostic}", flush=True)
+        raise ValueError("Nenhum Story acessível sem autenticação.")
+    return [p for p in media[:30] if 1024 <= p.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES]
+
+
+async def _telegram_show_instagram_stories(chat_id: int, username: str):
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory(prefix="ig_stories_") as folder:
+            media = await asyncio.to_thread(_telegram_instagram_stories_fetch, username, folder)
+            if not media:
+                await _telegram_send(chat_id, "Não encontrei Stories acessíveis nesse perfil.")
+                return
+            await _telegram_send(chat_id, f"Encontrei {len(media)} arquivo(s) de Stories de @{username}. Enviando...")
+            import mimetypes
+            for path in media:
+                try:
+                    method = "sendVideo" if path.suffix.lower() == ".mp4" else "sendPhoto"
+                    field = "video" if method == "sendVideo" else "photo"
+                    async with httpx.AsyncClient(timeout=90) as client:
+                        with path.open("rb") as handle:
+                            response = await client.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                                data={"chat_id": str(chat_id)},
+                                files={field: (path.name, handle, mimetypes.guess_type(path.name)[0] or "application/octet-stream")},
+                            )
+                        response.raise_for_status()
+                except Exception as exc:
+                    print(f"Instagram story send failed: {type(exc).__name__}: {str(exc)[:140]}", flush=True)
+            await _telegram_send(chat_id, f"Consulta de Stories de @{username} concluída.")
+    except Exception as exc:
+        print(f"Instagram stories lookup @{username} failed: {type(exc).__name__}: {str(exc)[:150]}", flush=True)
+        await _telegram_send(chat_id, "Não consegui acessar os Stories desse perfil. O Instagram pode exigir login, mesmo para perfis públicos; não significa que o perfil não tenha Stories.")
+
+
 @app.post("/api/telegram-webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
@@ -1011,6 +1061,16 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     message_text = message.get("text") or message.get("caption") or ""
     if not chat_id or not isinstance(message_text, str):
         print("Telegram: update without supported text/caption", flush=True)
+        return {"status": "ok"}
+
+    if message_text.strip().lower().startswith("/stories"):
+        raw = message_text.strip().split(maxsplit=1)
+        username = raw[1].strip().lstrip("@") if len(raw) == 2 else ""
+        if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+            await _telegram_send(chat_id, "Use /stories @usuario (perfil público do Instagram).")
+        else:
+            await _telegram_send(chat_id, f"Consultando Stories disponíveis de @{username}...")
+            background_tasks.add_task(_telegram_show_instagram_stories, chat_id, username)
         return {"status": "ok"}
 
     if message_text.strip().startswith("/perfil") or message_text.strip().startswith("@"):
