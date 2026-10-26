@@ -981,7 +981,11 @@ def _telegram_instagram_stories_fetch(username: str, folder: str):
     if not media:
         diagnostic = (proc.stderr or proc.stdout or "")[-350:]
         print(f"Instagram stories @{username}: gallery-dl exit={proc.returncode} {diagnostic}", flush=True)
-        raise ValueError("Nenhum Story acessível sem autenticação.")
+        if "NotFoundError" in diagnostic or "KeyError" in diagnostic:
+            raise ValueError("O Instagram recusou a consulta do perfil pelo extrator; não significa que o usuário não exista.")
+        if "login" in diagnostic.lower() or "authentication" in diagnostic.lower():
+            raise ValueError("O Instagram exige autenticação para consultar esses Stories.")
+        raise ValueError("Não foram encontrados Stories acessíveis nessa consulta.")
     return [p for p in media[:30] if 1024 <= p.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES]
 
 
