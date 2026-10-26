@@ -771,6 +771,25 @@ def _telegram_download_tiktok_photos(url: str, folder: str):
     return data.get("title") or "Fotos do TikTok", paths
 
 
+def _telegram_download_tiktok_ttdlp(url: str, folder: str):
+    """Fallback for public TikTok videos and image carousels."""
+    import subprocess
+    import sys
+    output = Path(folder) / "ttdlp_media"
+    output.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, "-m", "tt_dlp", "--output", str(output), "--no-stories", url]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=100, check=False, cwd=str(output))
+    files = sorted((p for p in output.rglob("*") if p.is_file() and p.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png")), key=lambda p: str(p))
+    if not files:
+        print(f"TikTok tt-dlp media failed: exit={result.returncode}; {(result.stderr or result.stdout)[-300:]}", flush=True)
+        raise ValueError("tt-dlp não encontrou mídia pública.")
+    files = files[:10]
+    for item in files:
+        if item.stat().st_size < 1024 or item.stat().st_size > TELEGRAM_MAX_VIDEO_BYTES:
+            raise ValueError("Mídia vazia ou maior que o limite.")
+    return "Publicação do TikTok", files if len(files) > 1 else files[0]
+
+
 def _telegram_download_cobalt(url: str, folder: str):
     import ipaddress
     import socket
@@ -838,13 +857,21 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                 host = (urlparse(url).hostname or "").lower()
                 if provider == "tikwm" and host in ("tiktok.com", "www.tiktok.com", "m.tiktok.com"):
                     if "Publicação de fotos" in str(cobalt_error):
-                        title, path = await asyncio.to_thread(_telegram_download_tiktok_photos, url, folder)
+                        try:
+                            title, path = await asyncio.to_thread(_telegram_download_tiktok_photos, url, folder)
+                        except Exception as photo_error:
+                            print(f"Telegram TikTok photos TikWM failed: {type(photo_error).__name__}: {str(photo_error)[:160]}", flush=True)
+                            title, path = await asyncio.to_thread(_telegram_download_tiktok_ttdlp, url, folder)
                     else:
                         try:
                             title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                         except Exception as yt_error:
                             print(f"Telegram TikTok yt-dlp fallback failed: {type(yt_error).__name__}", flush=True)
-                            title, path = await asyncio.to_thread(_telegram_download_cobalt, url, folder)
+                            try:
+                                title, path = await asyncio.to_thread(_telegram_download_cobalt, url, folder)
+                            except Exception as cobalt_fallback_error:
+                                print(f"Telegram TikTok Cobalt fallback failed: {type(cobalt_fallback_error).__name__}: {str(cobalt_fallback_error)[:160]}", flush=True)
+                                title, path = await asyncio.to_thread(_telegram_download_tiktok_ttdlp, url, folder)
                 elif provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com") or host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")):
                     raise
                 print(f"Telegram Cobalt failed for {host}; trying yt-dlp: {type(cobalt_error).__name__}", flush=True)
