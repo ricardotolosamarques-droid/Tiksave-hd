@@ -470,7 +470,7 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
                     )
                     videos = data["videos"]
         if not videos:
-            await _telegram_send(chat_id, "Nenhum post público encontrado para esse perfil.")
+            await _telegram_send(chat_id, "Não consegui listar publicações desse perfil pelas fontes disponíveis.")
             return
         lines = [f"Posts públicos de @{username}:", ""]
         keyboard = []
