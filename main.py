@@ -1016,10 +1016,49 @@ def _telegram_instagram_stories_via_saveapi(username: str, folder: str):
         return saved
 
 
+def _telegram_instagram_stories_instaloader(username: str, folder: str):
+    """Optional Instaloader session-file integration; never handles Instagram passwords."""
+    session_file = os.getenv("INSTAGRAM_SESSION_FILE", "").strip()
+    session_user = os.getenv("INSTAGRAM_SESSION_USER", "").strip()
+    if not session_file or not session_user:
+        return None
+    if not Path(session_file).is_file():
+        raise ValueError("Arquivo de sessão do Instagram não encontrado no servidor.")
+    import instaloader
+    destination = Path(folder) / "instaloader"
+    destination.mkdir(parents=True, exist_ok=True)
+    loader = instaloader.Instaloader(
+        dirname_pattern=str(destination / "{target}"),
+        filename_pattern="{date_utc}_UTC",
+        download_videos=True,
+        download_video_thumbnails=False,
+        save_metadata=False,
+        post_metadata_txt_pattern="",
+        quiet=True,
+    )
+    try:
+        loader.load_session_from_file(session_user, filename=session_file)
+        profile = instaloader.Profile.from_username(loader.context, username)
+        for story in loader.get_stories(userids=[profile.userid]):
+            for item in story.get_items():
+                loader.download_storyitem(item, target=username)
+    except instaloader.exceptions.LoginRequiredException as exc:
+        raise ValueError("A sessão do Instagram expirou ou não tem permissão para consultar Stories.") from exc
+    except instaloader.exceptions.ConnectionException as exc:
+        raise ValueError("O Instagram recusou ou limitou a consulta autenticada.") from exc
+    media = sorted((p for p in destination.rglob("*") if p.is_file() and p.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png")))
+    return [p for p in media if 1024 <= p.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES][:30]
+
+
 def _telegram_instagram_stories_fetch(username: str, folder: str):
     """Try the dedicated Stories extractor, then the profile extractor, without bypassing login."""
     import subprocess
     import sys
+    authenticated = _telegram_instagram_stories_instaloader(username, folder)
+    if authenticated is not None:
+        if authenticated:
+            return authenticated
+        raise ValueError("Não foram encontrados Stories acessíveis pela sessão autorizada.")
     external = _telegram_instagram_stories_via_saveapi(username, folder)
     if external is not None:
         if external:
