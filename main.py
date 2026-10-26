@@ -372,6 +372,36 @@ def _telegram_profile_ytdlp(username: str, cursor: int = 0):
     return {"videos": videos, "cursor": cursor + len(videos), "hasMore": len(videos) == 10 and cursor + 10 < 50}
 
 
+async def _telegram_profile_tikhub(username: str, cursor: int = 0):
+    """Optional paid API; configured only via Render secret TIKHUB_API_KEY."""
+    key = os.getenv("TIKHUB_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("TIKHUB_API_KEY not configured")
+    async with httpx.AsyncClient(timeout=25) as client:
+        response = await client.get(
+            "https://api.tikhub.io/api/v1/tiktok/app/v3/fetch_user_post_videos_v3",
+            params={"unique_id": username, "max_cursor": cursor, "count": 10},
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    if payload.get("code") not in (0, 200):
+        raise ValueError(f"TikHub API response code {payload.get('code')}")
+    data = payload.get("data") or {}
+    if not isinstance(data, dict):
+        raise ValueError("Unexpected TikHub data format")
+    raw = data.get("aweme_list") or data.get("itemList") or data.get("videos") or []
+    videos = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        video_id = str(item.get("aweme_id") or item.get("id") or item.get("video_id") or "")
+        if re.fullmatch(r"[0-9]{10,25}", video_id):
+            videos.append({"id": video_id, "title": item.get("desc") or item.get("title") or "Sem descrição"})
+    return {"videos": videos, "cursor": data.get("max_cursor") or data.get("cursor") or 0,
+            "hasMore": data.get("has_more") or data.get("hasMore")}
+
+
 async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int = 0):
     try:
         try:
@@ -388,10 +418,21 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
                 raise ValueError("TikWM returned invalid profile data")
         except Exception as tikwm_exc:
             print(f"TikTok profile TikWM unavailable: {type(tikwm_exc).__name__}", flush=True)
-            data = await asyncio.wait_for(
-                asyncio.to_thread(_telegram_profile_ytdlp, username, cursor), timeout=45
-            )
-            videos = data["videos"]
+            if os.getenv("TIKHUB_API_KEY", "").strip():
+                try:
+                    data = await _telegram_profile_tikhub(username, cursor)
+                    videos = data["videos"]
+                except Exception as api_exc:
+                    print(f"TikTok profile TikHub unavailable: {type(api_exc).__name__}: {str(api_exc)[:100]}", flush=True)
+                    data = await asyncio.wait_for(
+                        asyncio.to_thread(_telegram_profile_ytdlp, username, cursor), timeout=45
+                    )
+                    videos = data["videos"]
+            else:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(_telegram_profile_ytdlp, username, cursor), timeout=45
+                )
+                videos = data["videos"]
         if not videos:
             await _telegram_send(chat_id, "Nenhum post público encontrado para esse perfil.")
             return
