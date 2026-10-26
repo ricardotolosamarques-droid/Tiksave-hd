@@ -4,7 +4,7 @@ httpx
 beautifulsoup4
 yt-dlp[default]
 curl_cffi
-git+https://github.com/mikf/gallery-dl.git
+https://codeberg.org/mikf/gallery-dl/archive/master.tar.gz
 parth-dl
 pytubefix==11.2.1
 git+https://github.com/bajaam/tt-dlp.git
