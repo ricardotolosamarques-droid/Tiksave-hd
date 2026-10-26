@@ -408,7 +408,7 @@ def _telegram_profile_ttdlp(username: str, cursor: int = 0):
     import sys
     with tempfile.TemporaryDirectory(prefix="ttdlp_profile_") as folder:
         command = [sys.executable, "-m", "tt_dlp", "--dry-run", "--no-stories",
-                   "--limit", str(min(cursor + 10, 40)), "--output", folder,
+                   "--limit", "40", "--output", folder,
                    "--profile-store", os.path.join(folder, "profiles.json"),
                    f"@{username}"]
         result = subprocess.run(command, capture_output=True, text=True,
@@ -427,8 +427,7 @@ def _telegram_profile_ttdlp(username: str, cursor: int = 0):
             continue
         seen.add(match.group(1))
         items.append({"id": match.group(1), "title": filename[len(match.group(1)):].strip(" _")[:90]})
-    return {"videos": items[cursor:cursor + 10], "cursor": cursor + 10,
-            "hasMore": len(items) > cursor + 10}
+    return {"videos": items[:40], "cursor": len(items), "hasMore": False}
 
 
 async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int = 0):
@@ -437,7 +436,7 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
             async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
                 response = await client.get(
                     "https://www.tikwm.com/api/user/posts",
-                    params={"unique_id": username, "count": 10, "cursor": cursor},
+                    params={"unique_id": username, "count": 40, "cursor": 0},
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -474,7 +473,7 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
             return
         lines = [f"Posts públicos de @{username}:", ""]
         keyboard = []
-        for i, video in enumerate(videos[:10], 1):
+        for i, video in enumerate(videos[:40], 1):
             if not isinstance(video, dict):
                 continue
             video_id = str(video.get("video_id") or video.get("id") or "")
@@ -489,16 +488,6 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
         if not keyboard:
             await _telegram_send(chat_id, "Não encontrei vídeos públicos válidos nesse perfil.")
             return
-        if data.get("hasMore") or data.get("has_more"):
-            next_cursor = data.get("cursor")
-            try:
-                next_cursor = int(next_cursor)
-            except (TypeError, ValueError):
-                next_cursor = 0
-            if next_cursor > cursor:
-                token = secrets.token_urlsafe(9)
-                telegram_profiles[token] = (chat_id, username, next_cursor, time.time() + TELEGRAM_PROFILE_TTL)
-                keyboard.append([{"text": "Próximos posts ▶", "callback_data": f"tp:n:{token}"}])
         async with httpx.AsyncClient(timeout=20) as client:
             result = await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
