@@ -1128,6 +1128,22 @@ async def _telegram_show_instagram_stories(chat_id: int, username: str):
         await _telegram_send(chat_id, f"Não consegui recuperar os Stories de @{username}. Motivo: {str(exc)[:240]}")
 
 
+# Authorization is per Telegram user and expires after 24 hours.
+# In-memory grants reset when Render restarts or redeploys.
+telegram_stories_grants = {}
+
+
+async def _telegram_stories_delete_code_message(chat_id: int, message_id: int):
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
+                json={"chat_id": chat_id, "message_id": message_id},
+            )
+    except Exception:
+        pass
+
+
 @app.post("/api/telegram-webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
@@ -1177,7 +1193,40 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         print("Telegram: update without supported text/caption", flush=True)
         return {"status": "ok"}
 
-    if message_text.strip().lower().startswith("/stories"):
+    # The access code is only accepted in a private chat; never log it.
+    command = message_text.strip().split(maxsplit=1)[0].split("@")[0].lower() if message_text.strip() else ""
+    sender_id = (message.get("from") or {}).get("id")
+    chat_type = (message.get("chat") or {}).get("type")
+    stories_access_code = os.getenv("TELEGRAM_STORIES_ACCESS_CODE", "").strip()
+    if command == "/ativar":
+        if chat_type != "private" or not sender_id:
+            await _telegram_send(chat_id, "Por segurança, envie /ativar somente na conversa privada com o bot.")
+            return {"status": "ok"}
+        if not stories_access_code:
+            await _telegram_send(chat_id, "O administrador ainda não configurou o código de acesso aos Stories.")
+            return {"status": "ok"}
+        supplied = message_text.strip().partition(" ")[2].strip()
+        if not supplied:
+            await _telegram_send(chat_id, "Envie /ativar SEU_CODIGO em conversa privada. A autorização dura 24 horas.")
+            return {"status": "ok"}
+        # Remove the message containing the code where Telegram permissions allow it.
+        if message.get("message_id"):
+            await _telegram_stories_delete_code_message(chat_id, message["message_id"])
+        import hmac
+        if hmac.compare_digest(supplied.encode(), stories_access_code.encode()):
+            telegram_stories_grants[int(sender_id)] = time.time() + 86400
+            await _telegram_send(chat_id, "Acesso aos Stories liberado por 24 horas! Use /stories @usuario.")
+        else:
+            await _telegram_send(chat_id, "Código inválido. Confira e tente novamente em conversa privada.")
+        return {"status": "ok"}
+
+    if command == "/stories":
+        if not stories_access_code:
+            await _telegram_send(chat_id, "O acesso aos Stories ainda não foi configurado pelo administrador.")
+            return {"status": "ok"}
+        if not sender_id or telegram_stories_grants.get(int(sender_id), 0) <= time.time():
+            await _telegram_send(chat_id, "Acesso protegido. Abra a conversa privada com o bot e envie /ativar SEU_CODIGO. A liberação vale por 24 horas.")
+            return {"status": "ok"}
         raw = message_text.strip().split(maxsplit=1)
         username = raw[1].strip().lstrip("@") if len(raw) == 2 else ""
         if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
