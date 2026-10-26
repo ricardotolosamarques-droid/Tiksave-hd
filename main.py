@@ -471,31 +471,27 @@ async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int
         if not videos:
             await _telegram_send(chat_id, "Não consegui listar publicações desse perfil pelas fontes disponíveis.")
             return
-        lines = [f"Posts públicos de @{username}:", ""]
-        keyboard = []
-        for i, video in enumerate(videos[:40], 1):
+        urls = []
+        for video in videos[:40]:
             if not isinstance(video, dict):
                 continue
             video_id = str(video.get("video_id") or video.get("id") or "")
             if not re.fullmatch(r"[0-9]{10,25}", video_id):
                 continue
-            desc = " ".join(str(video.get("title") or "Sem descrição").split())[:90]
-            lines.append(f"{i}. {desc}")
-            url = f"https://www.tiktok.com/@{username}/video/{video_id}"
-            token = secrets.token_urlsafe(9)
-            telegram_profiles[token] = (chat_id, username, url, time.time() + TELEGRAM_PROFILE_TTL)
-            keyboard.append([{"text": f"Vídeo {i} · abrir opções", "callback_data": f"tp:v:{token}"}])
-        if not keyboard:
+            urls.append(f"https://www.tiktok.com/@{username}/video/{video_id}")
+        if not urls:
             await _telegram_send(chat_id, "Não encontrei vídeos públicos válidos nesse perfil.")
             return
-        async with httpx.AsyncClient(timeout=20) as client:
-            result = await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": "\n".join(lines)[:4000],
-                      "reply_markup": {"inline_keyboard": keyboard},
-                      "disable_web_page_preview": True},
-            )
-            result.raise_for_status()
+        await _telegram_send(
+            chat_id,
+            f"Encontrei {len(urls)} publicações de @{username}. Vou enviar os vídeos automaticamente, um por vez. Alguns podem falhar ou ser fotos."
+        )
+        for index, url in enumerate(urls, 1):
+            try:
+                await _telegram_process_video(chat_id, url, "tikwm")
+            except Exception as error:
+                print(f"Telegram profile auto-send item {index} failed: {type(error).__name__}", flush=True)
+        await _telegram_send(chat_id, f"Envio do perfil @{username} finalizado. Foram processadas {len(urls)} publicações.")
     except Exception as exc:
         print(f"TikTok profile lookup failed: {type(exc).__name__}: {str(exc)[:150]}", flush=True)
         await _telegram_send(chat_id, "Não foi possível carregar os posts públicos desse perfil agora.")
