@@ -337,12 +337,17 @@ TELEGRAM_PROFILE_TTL = 1200
 
 def _telegram_parse_tiktok_username(text: str):
     raw = text.strip()
-    if raw.lower().startswith("/perfil"):
-        raw = raw.split(maxsplit=1)[1].strip() if len(raw.split(maxsplit=1)) > 1 else ""
-    elif raw.startswith("@"):
+    if raw.lower().startswith(("/perfil ", "@perfil ")):
+        raw = raw.split(maxsplit=1)[1].strip()
+    elif raw.lower() in ("/perfil", "@perfil"):
+        return None
+    if raw.startswith("@"):
         raw = raw[1:]
-    else:
-        match = re.fullmatch(r"https://(?:www\\.|m\\.)?tiktok\\.com/@([A-Za-z0-9._]{2,24})/?(?:\\?.*)?", raw)
+    if raw.startswith("https://"):
+        parsed = urlparse(raw)
+        if (parsed.hostname or "").lower() not in ("www.tiktok.com", "m.tiktok.com", "tiktok.com"):
+            return None
+        match = re.fullmatch(r"/@([A-Za-z0-9._]{2,24})/?", parsed.path)
         if not match:
             return None
         raw = match.group(1)
