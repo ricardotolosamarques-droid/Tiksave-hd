@@ -422,7 +422,7 @@ def _telegram_profile_ttdlp(username: str, cursor: int = 0):
         if not line.startswith("[dry-run] "):
             continue
         filename = line[len("[dry-run] "):]
-        match = re.match(r"^([0-9]{10,25})(?:[_ ]|\\.)", filename)
+        match = re.match(r"^([0-9]{10,25})(?:[_ ]|[.])", filename)
         if not match or match.group(1) in seen:
             continue
         seen.add(match.group(1))
