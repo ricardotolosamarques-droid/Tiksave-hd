@@ -354,21 +354,44 @@ def _telegram_parse_tiktok_username(text: str):
     return raw if re.fullmatch(r"[A-Za-z0-9._]{2,24}", raw) else None
 
 
+def _telegram_profile_ytdlp(username: str, cursor: int = 0):
+    """Fallback: list public profile entries without downloading media."""
+    url = f"https://www.tiktok.com/@{username}"
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True,
+                          "extract_flat": "in_playlist", "playlistend": min(cursor + 10, 50),
+                          "socket_timeout": 12, "retries": 0, "ignoreerrors": True}) as ydl:
+        result = ydl.extract_info(url, download=False)
+    entries = (result or {}).get("entries") or []
+    videos = []
+    for item in list(entries)[cursor:cursor + 10]:
+        if not isinstance(item, dict):
+            continue
+        video_id = str(item.get("id") or "")
+        if re.fullmatch(r"[0-9]{10,25}", video_id):
+            videos.append({"id": video_id, "title": item.get("title") or item.get("description") or "Sem descrição"})
+    return {"videos": videos, "cursor": cursor + len(videos), "hasMore": len(videos) == 10 and cursor + 10 < 50}
+
+
 async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int = 0):
     try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=False) as client:
-            response = await client.get(
-                "https://www.tikwm.com/api/user/posts",
-                params={"unique_id": username, "count": 10, "cursor": cursor},
-                headers={"User-Agent": "TikSaveHD/1.0"},
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+                response = await client.get(
+                    "https://www.tikwm.com/api/user/posts",
+                    params={"unique_id": username, "count": 10, "cursor": cursor},
+                )
+                response.raise_for_status()
+                payload = response.json()
+            data = payload.get("data") or {}
+            videos = data.get("videos") or []
+            if payload.get("code") != 0 or not isinstance(videos, list):
+                raise ValueError("TikWM returned invalid profile data")
+        except Exception as tikwm_exc:
+            print(f"TikTok profile TikWM unavailable: {type(tikwm_exc).__name__}", flush=True)
+            data = await asyncio.wait_for(
+                asyncio.to_thread(_telegram_profile_ytdlp, username, cursor), timeout=45
             )
-            response.raise_for_status()
-            payload = response.json()
-        data = payload.get("data") or {}
-        videos = data.get("videos") or []
-        if payload.get("code") != 0 or not isinstance(videos, list):
-            await _telegram_send(chat_id, "Não consegui consultar os posts desse perfil público agora. Tente novamente mais tarde.")
-            return
+            videos = data["videos"]
         if not videos:
             await _telegram_send(chat_id, "Nenhum post público encontrado para esse perfil.")
             return
