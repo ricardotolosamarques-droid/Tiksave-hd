@@ -874,44 +874,45 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                                 title, path = await asyncio.to_thread(_telegram_download_tiktok_ttdlp, url, folder)
                 elif provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com") or host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")):
                     raise
-                print(f"Telegram Cobalt failed for {host}; trying yt-dlp: {type(cobalt_error).__name__}", flush=True)
-                try:
-                    if host == "instagram.com" or host.endswith(".instagram.com"):
-                        try:
-                            title, path = await asyncio.to_thread(_telegram_download_parth_dl, url, folder)
-                        except Exception as parth_error:
-                            print(f"Telegram Instagram parth-dl failed: {type(parth_error).__name__}: {str(parth_error)[:180]}", flush=True)
+                else:
+                    print(f"Telegram Cobalt failed for {host}; trying yt-dlp: {type(cobalt_error).__name__}", flush=True)
+                    try:
+                        if host == "instagram.com" or host.endswith(".instagram.com"):
                             try:
-                                title, path = await asyncio.to_thread(_telegram_download_gallery_dl, url, folder)
-                            except Exception as gallery_error:
-                                print(f"Telegram Instagram gallery-dl failed: {type(gallery_error).__name__}: {str(gallery_error)[:180]}", flush=True)
+                                title, path = await asyncio.to_thread(_telegram_download_parth_dl, url, folder)
+                            except Exception as parth_error:
+                                print(f"Telegram Instagram parth-dl failed: {type(parth_error).__name__}: {str(parth_error)[:180]}", flush=True)
+                                try:
+                                    title, path = await asyncio.to_thread(_telegram_download_gallery_dl, url, folder)
+                                except Exception as gallery_error:
+                                    print(f"Telegram Instagram gallery-dl failed: {type(gallery_error).__name__}: {str(gallery_error)[:180]}", flush=True)
+                                    title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                        else:
+                            try:
                                 title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
-                    else:
-                        try:
-                            title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
-                        except Exception as youtube_yt_error:
-                            print(f"Telegram YouTube yt-dlp failed: {type(youtube_yt_error).__name__}: {str(youtube_yt_error)[:180]}", flush=True)
-                            try:
-                                title, path = await asyncio.wait_for(
-                                    asyncio.to_thread(_telegram_download_youtube_clients, url, folder), timeout=100
-                                )
-                            except Exception as client_error:
-                                print(f"Telegram YouTube alternate clients failed: {type(client_error).__name__}", flush=True)
-                                title, path = await asyncio.wait_for(
-                                    asyncio.to_thread(_telegram_download_pytubefix, url, folder), timeout=100
-                                )
-                except Exception as fallback_error:
-                    print(f"Telegram alternative download failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
-                    if host == "instagram.com" or host.endswith(".instagram.com"):
-                        if "/stories/" in urlparse(url).path.lower():
-                            story_parts = [part for part in urlparse(url).path.split("/") if part]
-                            story_id = story_parts[2] if len(story_parts) >= 3 else "unknown"
-                            print(f"Telegram Instagram Story unavailable: story_id={story_id}; cause={type(fallback_error).__name__}", flush=True)
-                            raise ValueError("Não foi possível acessar este Story pelo servidor. Mesmo em perfis públicos, o Instagram pode exigir login para Stories. Reels e publicações continuam disponíveis.") from fallback_error
-                        raise ValueError("O Instagram está bloqueando o acesso automático do servidor. Cobalt, parth-dl, gallery-dl e yt-dlp não conseguiram extrair o vídeo.") from fallback_error
-                    if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
-                        raise ValueError("O YouTube está exigindo verificação ou login do servidor; Cobalt, yt-dlp e pytubefix falharam.") from fallback_error
-                    raise ValueError("Nenhum extrator conseguiu acessar o vídeo.") from fallback_error
+                            except Exception as youtube_yt_error:
+                                print(f"Telegram YouTube yt-dlp failed: {type(youtube_yt_error).__name__}: {str(youtube_yt_error)[:180]}", flush=True)
+                                try:
+                                    title, path = await asyncio.wait_for(
+                                        asyncio.to_thread(_telegram_download_youtube_clients, url, folder), timeout=100
+                                    )
+                                except Exception as client_error:
+                                    print(f"Telegram YouTube alternate clients failed: {type(client_error).__name__}", flush=True)
+                                    title, path = await asyncio.wait_for(
+                                        asyncio.to_thread(_telegram_download_pytubefix, url, folder), timeout=100
+                                    )
+                    except Exception as fallback_error:
+                        print(f"Telegram alternative download failed for {host}: {type(fallback_error).__name__}: {str(fallback_error)[:180]}", flush=True)
+                        if host == "instagram.com" or host.endswith(".instagram.com"):
+                            if "/stories/" in urlparse(url).path.lower():
+                                story_parts = [part for part in urlparse(url).path.split("/") if part]
+                                story_id = story_parts[2] if len(story_parts) >= 3 else "unknown"
+                                print(f"Telegram Instagram Story unavailable: story_id={story_id}; cause={type(fallback_error).__name__}", flush=True)
+                                raise ValueError("Não foi possível acessar este Story pelo servidor. Mesmo em perfis públicos, o Instagram pode exigir login para Stories. Reels e publicações continuam disponíveis.") from fallback_error
+                            raise ValueError("O Instagram está bloqueando o acesso automático do servidor. Cobalt, parth-dl, gallery-dl e yt-dlp não conseguiram extrair o vídeo.") from fallback_error
+                        if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
+                            raise ValueError("O YouTube está exigindo verificação ou login do servidor; Cobalt, yt-dlp e pytubefix falharam.") from fallback_error
+                        raise ValueError("Nenhum extrator conseguiu acessar o vídeo.") from fallback_error
             import mimetypes
             from contextlib import ExitStack
             media_paths = path if isinstance(path, list) else [path]
