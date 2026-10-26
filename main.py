@@ -724,6 +724,53 @@ def _telegram_download_tikwm(url: str, folder: str):
         raise ValueError("Muitos redirecionamentos.")
 
 
+def _telegram_download_tiktok_photos(url: str, folder: str):
+    """Download up to ten public photo slides through TikWM."""
+    import ipaddress
+    import socket
+    from urllib.parse import urljoin
+    with httpx.Client(timeout=30, follow_redirects=False) as client:
+        response = client.get("https://www.tikwm.com/api/", params={"url": url})
+        response.raise_for_status()
+        data = (response.json().get("data") or {})
+        images = data.get("images") or []
+        if not isinstance(images, list) or not images:
+            raise ValueError("Fotos não disponíveis nesta fonte.")
+        paths = []
+        for index, item in enumerate(images[:10]):
+            media_url = item if isinstance(item, str) else (item.get("url") or "") if isinstance(item, dict) else ""
+            media_url = urljoin("https://www.tikwm.com/", media_url)
+            for redirect in range(4):
+                parsed = urlparse(media_url)
+                host = (parsed.hostname or "").lower()
+                if parsed.scheme != "https" or parsed.username or parsed.password or not host or not (host == "tikwm.com" or host.endswith((".tikwm.com", ".tiktokcdn.com", ".tiktokcdn-us.com", ".byteoversea.com", ".byteoversea.net", ".ibytedtos.com"))):
+                    raise ValueError("Domínio de imagem não permitido.")
+                addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+                if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+                    raise ValueError("Destino de imagem não público.")
+                with client.stream("GET", media_url) as media:
+                    if media.status_code in (301, 302, 303, 307, 308):
+                        media_url = urljoin(media_url, media.headers.get("location") or "")
+                        continue
+                    media.raise_for_status()
+                    output = Path(folder) / f"photo_{index}.jpg"
+                    total = 0
+                    with output.open("wb") as f:
+                        for chunk in media.iter_bytes(65536):
+                            total += len(chunk)
+                            if total > 10 * 1024 * 1024:
+                                raise ValueError("Foto maior que 10 MB.")
+                            f.write(chunk)
+                    with output.open("rb") as f:
+                        if f.read(2) != bytes([255, 216]):
+                            raise ValueError("Imagem não é JPEG.")
+                    paths.append(output)
+                    break
+            else:
+                raise ValueError("Redirecionamentos excessivos.")
+    return data.get("title") or "Fotos do TikTok", paths
+
+
 def _telegram_download_cobalt(url: str, folder: str):
     import ipaddress
     import socket
@@ -789,7 +836,16 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                 title, path = await asyncio.to_thread(downloader, url, folder)
             except Exception as cobalt_error:
                 host = (urlparse(url).hostname or "").lower()
-                if provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com") or host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")):
+                if provider == "tikwm" and host in ("tiktok.com", "www.tiktok.com", "m.tiktok.com"):
+                    if "Publicação de fotos" in str(cobalt_error):
+                        title, path = await asyncio.to_thread(_telegram_download_tiktok_photos, url, folder)
+                    else:
+                        try:
+                            title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                        except Exception as yt_error:
+                            print(f"Telegram TikTok yt-dlp fallback failed: {type(yt_error).__name__}", flush=True)
+                            title, path = await asyncio.to_thread(_telegram_download_cobalt, url, folder)
+                elif provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com") or host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")):
                     raise
                 print(f"Telegram Cobalt failed for {host}; trying yt-dlp: {type(cobalt_error).__name__}", flush=True)
                 try:
