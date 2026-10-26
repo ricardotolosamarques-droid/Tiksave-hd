@@ -330,6 +330,83 @@ async def _telegram_show_choices(chat_id: int, url: str, platform: str):
         response.raise_for_status()
 
 
+# TikTok public profile browsing; opaque, expiring callbacks keep usernames out of callback_data.
+telegram_profiles = {}
+TELEGRAM_PROFILE_TTL = 1200
+
+
+def _telegram_parse_tiktok_username(text: str):
+    raw = text.strip()
+    if raw.lower().startswith("/perfil"):
+        raw = raw.split(maxsplit=1)[1].strip() if len(raw.split(maxsplit=1)) > 1 else ""
+    elif raw.startswith("@"):
+        raw = raw[1:]
+    else:
+        match = re.fullmatch(r"https://(?:www\\.|m\\.)?tiktok\\.com/@([A-Za-z0-9._]{2,24})/?(?:\\?.*)?", raw)
+        if not match:
+            return None
+        raw = match.group(1)
+    return raw if re.fullmatch(r"[A-Za-z0-9._]{2,24}", raw) else None
+
+
+async def _telegram_show_tiktok_profile(chat_id: int, username: str, cursor: int = 0):
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=False) as client:
+            response = await client.get(
+                "https://www.tikwm.com/api/user/posts",
+                params={"unique_id": username, "count": 10, "cursor": cursor},
+                headers={"User-Agent": "TikSaveHD/1.0"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        data = payload.get("data") or {}
+        videos = data.get("videos") or []
+        if payload.get("code") != 0 or not isinstance(videos, list):
+            await _telegram_send(chat_id, "Não consegui consultar os posts desse perfil público agora. Tente novamente mais tarde.")
+            return
+        if not videos:
+            await _telegram_send(chat_id, "Nenhum post público encontrado para esse perfil.")
+            return
+        lines = [f"Posts públicos de @{username}:", ""]
+        keyboard = []
+        for i, video in enumerate(videos[:10], 1):
+            if not isinstance(video, dict):
+                continue
+            video_id = str(video.get("video_id") or video.get("id") or "")
+            if not re.fullmatch(r"\\d{10,25}", video_id):
+                continue
+            desc = " ".join(str(video.get("title") or "Sem descrição").split())[:90]
+            lines.append(f"{i}. {desc}")
+            url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+            token = secrets.token_urlsafe(9)
+            telegram_profiles[token] = (chat_id, username, url, time.time() + TELEGRAM_PROFILE_TTL)
+            keyboard.append([{"text": f"Vídeo {i} · abrir opções", "callback_data": f"tp:v:{token}"}])
+        if not keyboard:
+            await _telegram_send(chat_id, "Não encontrei vídeos públicos válidos nesse perfil.")
+            return
+        if data.get("hasMore") or data.get("has_more"):
+            next_cursor = data.get("cursor")
+            try:
+                next_cursor = int(next_cursor)
+            except (TypeError, ValueError):
+                next_cursor = 0
+            if next_cursor > cursor:
+                token = secrets.token_urlsafe(9)
+                telegram_profiles[token] = (chat_id, username, next_cursor, time.time() + TELEGRAM_PROFILE_TTL)
+                keyboard.append([{"text": "Próximos posts ▶", "callback_data": f"tp:n:{token}"}])
+        async with httpx.AsyncClient(timeout=20) as client:
+            result = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": "\\n".join(lines)[:4000],
+                      "reply_markup": {"inline_keyboard": keyboard},
+                      "disable_web_page_preview": True},
+            )
+            result.raise_for_status()
+    except Exception as exc:
+        print(f"TikTok profile lookup failed: {type(exc).__name__}: {str(exc)[:150]}", flush=True)
+        await _telegram_send(chat_id, "Não foi possível carregar os posts públicos desse perfil agora.")
+
+
 async def _telegram_answer_callback(callback_id: str, text: str = ""):
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.post(
@@ -727,6 +804,19 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         callback_message = callback.get("message") or {}
         chat_id = (callback_message.get("chat") or {}).get("id")
         parts = callback_data.split(":")
+        if callback_id and len(parts) == 3 and parts[0] == "tp":
+            item = telegram_profiles.pop(parts[2], None)
+            if not item or item[0] != chat_id or item[3] < time.time():
+                await _telegram_answer_callback(callback_id, "Pesquisa expirada. Envie /perfil @usuario novamente.")
+            elif parts[1] == "v":
+                await _telegram_answer_callback(callback_id, "Escolha como baixar:")
+                await _telegram_show_choices(chat_id, item[2], "tiktok")
+            elif parts[1] == "n":
+                await _telegram_answer_callback(callback_id, "Carregando mais posts...")
+                background_tasks.add_task(_telegram_show_tiktok_profile, chat_id, item[1], item[2])
+            else:
+                await _telegram_answer_callback(callback_id, "Opção inválida.")
+            return {"status": "ok"}
         if callback_id and len(parts) == 3 and parts[0] == "dl":
             provider, choice_id = parts[1], parts[2]
             choice = telegram_choices.get(choice_id)
@@ -749,8 +839,16 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         print("Telegram: update without supported text/caption", flush=True)
         return {"status": "ok"}
 
+    if message_text.strip().startswith("/perfil") or message_text.strip().startswith("@"):
+        username = _telegram_parse_tiktok_username(message_text)
+        if not username:
+            await _telegram_send(chat_id, "Use /perfil @usuario (exemplo: /perfil @tiktok).")
+        else:
+            background_tasks.add_task(_telegram_show_tiktok_profile, chat_id, username)
+        return {"status": "ok"}
+
     if message_text.strip().startswith("/start"):
-        await _telegram_send(chat_id, "Olá! Envie um link público do TikTok, Instagram, YouTube, Facebook, X, Reddit ou Pinterest. Para TikTok: TikWM ou Cobalt. Para as demais redes: Cobalt.")
+        await _telegram_send(chat_id, "Olá! Envie um link público do TikTok, Instagram, YouTube, Facebook, X, Reddit ou Pinterest. Para TikTok: TikWM ou Cobalt. Para as demais redes: Cobalt. Para ver posts públicos de um perfil TikTok, envie /perfil @usuario.")
         return {"status": "ok"}
 
     url, platform = _telegram_link_from_message(message_text)
