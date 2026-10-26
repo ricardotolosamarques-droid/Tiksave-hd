@@ -1016,7 +1016,7 @@ async def _telegram_show_instagram_stories(chat_id: int, username: str):
             await _telegram_send(chat_id, f"Consulta de Stories de @{username} concluída.")
     except Exception as exc:
         print(f"Instagram stories lookup @{username} failed: {type(exc).__name__}: {str(exc)[:150]}", flush=True)
-        await _telegram_send(chat_id, "Não consegui acessar os Stories desse perfil. O Instagram pode exigir login, mesmo para perfis públicos; não significa que o perfil não tenha Stories.")
+        await _telegram_send(chat_id, f"Não consegui recuperar os Stories de @{username}. Motivo: {str(exc)[:240]}")
 
 
 @app.post("/api/telegram-webhook")
