@@ -964,10 +964,67 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
             pass
 
 
+def _telegram_instagram_stories_via_saveapi(username: str, folder: str):
+    """Optional third-party provider. Configure SAVEAPI_KEY in Render secrets."""
+    key = os.getenv("SAVEAPI_KEY", "").strip()
+    if not key:
+        return None
+    destination = Path(folder) / "saveapi_stories"
+    destination.mkdir(parents=True, exist_ok=True)
+    with httpx.Client(timeout=55, follow_redirects=True) as client:
+        response = client.get("https://api.saveapi.org/v1/instagram",
+                              headers={"Authorization": f"Bearer {key}"},
+                              params={"url": f"https://www.instagram.com/stories/{username}/"})
+        if response.status_code in (401, 403):
+            raise ValueError("Chave SaveAPI inválida ou sem permissão.")
+        if response.status_code == 429:
+            raise ValueError("Limite de consultas SaveAPI atingido.")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Resposta inválida da SaveAPI.")
+        if payload.get("error") or payload.get("code") == "MEDIA_NOT_FOUND":
+            raise ValueError("SaveAPI não encontrou Stories públicos disponíveis.")
+        data = payload.get("data")
+        medias = payload.get("medias") or (data.get("medias") if isinstance(data, dict) else None) or []
+        if not isinstance(medias, list):
+            raise ValueError("Lista de Stories inválida.")
+        saved = []
+        for i, item in enumerate(medias[:30]):
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url")
+            if not isinstance(url, str) or not url.startswith("https://"):
+                continue
+            ext = ".mp4" if "video" in str(item.get("type", "")).lower() else ".jpg"
+            target = destination / f"story_{i:02d}{ext}"
+            try:
+                with client.stream("GET", url) as stream:
+                    stream.raise_for_status()
+                    with target.open("wb") as handle:
+                        total = 0
+                        for chunk in stream.iter_bytes(chunk_size=65536):
+                            total += len(chunk)
+                            if total > TELEGRAM_MAX_VIDEO_BYTES:
+                                raise ValueError("Arquivo grande demais.")
+                            handle.write(chunk)
+                if 1024 <= target.stat().st_size <= TELEGRAM_MAX_VIDEO_BYTES:
+                    saved.append(target)
+            except Exception as exc:
+                print(f"SaveAPI story {i} download failed: {type(exc).__name__}", flush=True)
+                target.unlink(missing_ok=True)
+        return saved
+
+
 def _telegram_instagram_stories_fetch(username: str, folder: str):
     """Try the dedicated Stories extractor, then the profile extractor, without bypassing login."""
     import subprocess
     import sys
+    external = _telegram_instagram_stories_via_saveapi(username, folder)
+    if external is not None:
+        if external:
+            return external
+        raise ValueError("SaveAPI não retornou Stories disponíveis.")
     destination = Path(folder) / "stories"
     destination.mkdir(parents=True, exist_ok=True)
     attempts = [
