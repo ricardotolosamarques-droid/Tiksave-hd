@@ -971,7 +971,8 @@ def _telegram_instagram_stories_fetch(username: str, folder: str):
     destination = Path(folder) / "stories"
     destination.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, "-m", "gallery_dl", "--directory", str(destination),
-           "--range", "1-30", f"https://www.instagram.com/stories/{username}/"]
+           "--option", "extractor.instagram.include=stories",
+           "--range", "1-30", f"https://www.instagram.com/{username}/"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     except subprocess.TimeoutExpired as exc:
