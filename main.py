@@ -725,7 +725,7 @@ def _telegram_download_tikwm(url: str, folder: str):
 
 
 def _telegram_download_tiktok_photos(url: str, folder: str):
-    """Download up to ten public photo slides through TikWM."""
+    """Download up to 50 public photo slides through TikWM."""
     import ipaddress
     import socket
     from urllib.parse import urljoin
@@ -737,7 +737,7 @@ def _telegram_download_tiktok_photos(url: str, folder: str):
         if not isinstance(images, list) or not images:
             raise ValueError("Fotos não disponíveis nesta fonte.")
         paths = []
-        for index, item in enumerate(images[:10]):
+        for index, item in enumerate(images[:50]):
             media_url = item if isinstance(item, str) else (item.get("url") or "") if isinstance(item, dict) else ""
             media_url = urljoin("https://www.tikwm.com/", media_url)
             for redirect in range(4):
@@ -783,7 +783,7 @@ def _telegram_download_tiktok_ttdlp(url: str, folder: str):
     if not files:
         print(f"TikTok tt-dlp media failed: exit={result.returncode}; {(result.stderr or result.stdout)[-300:]}", flush=True)
         raise ValueError("tt-dlp não encontrou mídia pública.")
-    files = files[:10]
+    files = files[:50]
     for item in files:
         if item.stat().st_size < 1024 or item.stat().st_size > TELEGRAM_MAX_VIDEO_BYTES:
             raise ValueError("Mídia vazia ou maior que o limite.")
@@ -947,22 +947,40 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                         )
                 else:
                     import json
-                    with ExitStack() as stack:
-                        files = {}
-                        entries = []
-                        for index, item in enumerate(media_paths):
-                            key = f"media{index}"
+                    # Telegram allows at most 10 items per media group.
+                    # Keep the original order, including the final smaller group.
+                    for batch_start in range(0, len(media_paths), 10):
+                        batch = media_paths[batch_start:batch_start + 10]
+                        if len(batch) == 1:
+                            item = batch[0]
                             is_video = item.suffix.lower() == ".mp4"
-                            entries.append({"type": "video" if is_video else "photo", "media": f"attach://{key}", **({"caption": title[:900]} if index == 0 else {})})
-                            files[key] = (item.name, stack.enter_context(item.open("rb")), mimetypes.guess_type(item.name)[0] or "application/octet-stream")
-                        response = await client.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
-                            data={"chat_id": str(chat_id), "media": json.dumps(entries)},
-                            files=files,
-                        )
-                response.raise_for_status()
-                if not response.json().get("ok"):
-                    raise ValueError("Telegram recusou o envio.")
+                            with item.open("rb") as media_file:
+                                response = await client.post(
+                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{'sendVideo' if is_video else 'sendPhoto'}",
+                                    data={"chat_id": str(chat_id), **({"caption": title[:900]} if batch_start == 0 else {})},
+                                    files={("video" if is_video else "photo"): (item.name, media_file, mimetypes.guess_type(item.name)[0] or "application/octet-stream")},
+                                )
+                        else:
+                            with ExitStack() as stack:
+                                files = {}
+                                entries = []
+                                for index, item in enumerate(batch):
+                                    key = f"media{index}"
+                                    is_video = item.suffix.lower() == ".mp4"
+                                    entries.append({"type": "video" if is_video else "photo", "media": f"attach://{key}", **({"caption": title[:900]} if batch_start == 0 and index == 0 else {})})
+                                    files[key] = (item.name, stack.enter_context(item.open("rb")), mimetypes.guess_type(item.name)[0] or "application/octet-stream")
+                                response = await client.post(
+                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup",
+                                    data={"chat_id": str(chat_id), "media": json.dumps(entries)},
+                                    files=files,
+                                )
+                        response.raise_for_status()
+                        if not response.json().get("ok"):
+                            raise ValueError(f"Telegram recusou o envio do álbum {batch_start // 10 + 1}.")
+                if len(media_paths) == 1:
+                    response.raise_for_status()
+                    if not response.json().get("ok"):
+                        raise ValueError("Telegram recusou o envio.")
 
     except Exception as error:
         print(f"Telegram send failed: {type(error).__name__}: {str(error)[:250]}")
