@@ -872,6 +872,23 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                             except Exception as cobalt_fallback_error:
                                 print(f"Telegram TikTok Cobalt fallback failed: {type(cobalt_fallback_error).__name__}: {str(cobalt_fallback_error)[:160]}", flush=True)
                                 title, path = await asyncio.to_thread(_telegram_download_tiktok_ttdlp, url, folder)
+                elif provider == "cobalt" and (host == "tiktok.com" or host.endswith(".tiktok.com")):
+                    # Cobalt can return a photo picker or an intermittent 502.
+                    # Try the TikTok-specific providers before reporting failure.
+                    print(f"Telegram TikTok Cobalt failed: {type(cobalt_error).__name__}: {str(cobalt_error)[:160]}", flush=True)
+                    try:
+                        title, path = await asyncio.to_thread(_telegram_download_tikwm, url, folder)
+                    except Exception as tikwm_error:
+                        if "Publicação de fotos" in str(tikwm_error):
+                            try:
+                                title, path = await asyncio.to_thread(_telegram_download_tiktok_photos, url, folder)
+                            except Exception:
+                                title, path = await asyncio.to_thread(_telegram_download_tiktok_ttdlp, url, folder)
+                        else:
+                            try:
+                                title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
+                            except Exception:
+                                title, path = await asyncio.to_thread(_telegram_download_tiktok_ttdlp, url, folder)
                 elif provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com") or host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")):
                     raise
                 else:
