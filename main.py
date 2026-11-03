@@ -834,6 +834,72 @@ def _telegram_download_cobalt(url: str, folder: str):
     raise ValueError("Muitos redirecionamentos.")
 
 
+def _telegram_download_fxtwitter(url: str, folder: str):
+    """Fallback for publicly accessible X/Twitter video posts via FxTwitter API."""
+    import ipaddress
+    import socket
+    from urllib.parse import urljoin
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in ("x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"):
+        raise ValueError("Link não pertence ao Twitter/X.")
+    match = re.search(r"/status/(\\d+)(?:/|$)", parsed.path)
+    if not match:
+        raise ValueError("Link do Twitter/X sem ID de publicação.")
+    status_id = match.group(1)
+    with httpx.Client(timeout=25, follow_redirects=False) as client:
+        response = client.get(f"https://api.fxtwitter.com/status/{status_id}",
+                              headers={"Accept": "application/json"})
+        response.raise_for_status()
+        payload = response.json()
+        tweet = payload.get("tweet") or {}
+        media = tweet.get("media") or {}
+        videos = media.get("videos") or []
+        candidates = [v for v in videos if isinstance(v, dict)
+                      and isinstance(v.get("url"), str)
+                      and v["url"].startswith("https://")]
+        if not candidates:
+            raise ValueError("FxTwitter não encontrou vídeo público.")
+        candidates.sort(key=lambda v: (v.get("width") or 0) * (v.get("height") or 0),
+                        reverse=True)
+        media_url = candidates[0]["url"]
+        path = Path(folder) / "fxtwitter_video.mp4"
+        for _ in range(5):
+            parsed_media = urlparse(media_url)
+            hostname = (parsed_media.hostname or "").lower()
+            if (parsed_media.scheme != "https" or not hostname or
+                    parsed_media.username or parsed_media.password):
+                raise ValueError("Endereço de mídia inválido.")
+            addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+            if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global
+                                    for a in addresses):
+                raise ValueError("Destino de mídia não público.")
+            with client.stream("GET", media_url,
+                               headers={"Accept": "video/mp4,application/octet-stream"}) as stream:
+                if stream.status_code in (301, 302, 303, 307, 308):
+                    location = stream.headers.get("location")
+                    if not location:
+                        raise ValueError("Redirecionamento sem destino.")
+                    media_url = urljoin(media_url, location)
+                    continue
+                stream.raise_for_status()
+                mime = stream.headers.get("content-type", "").split(";")[0].lower()
+                if mime.startswith("audio/") or mime in ("text/html", "application/json"):
+                    raise ValueError("FxTwitter não retornou vídeo.")
+                total = 0
+                with path.open("wb") as output:
+                    for chunk in stream.iter_bytes(chunk_size=65536):
+                        total += len(chunk)
+                        if total > TELEGRAM_MAX_VIDEO_BYTES:
+                            raise ValueError("Vídeo excede o limite do Telegram.")
+                        output.write(chunk)
+                if total < 1024 or b"ftyp" not in path.read_bytes()[:16]:
+                    raise ValueError("FxTwitter não retornou MP4 válido.")
+                return "Vídeo • FxTwitter", path
+        raise ValueError("Muitos redirecionamentos.")
+
+
 def _telegram_download(url: str, folder: str):
     for name, downloader in (
         ("yt-dlp", _telegram_download_yt_dlp),
@@ -889,6 +955,9 @@ async def _telegram_process_video(chat_id: int, url: str, provider: str):
                                 title, path = await asyncio.to_thread(_telegram_download_yt_dlp, url, folder)
                             except Exception:
                                 title, path = await asyncio.to_thread(_telegram_download_tiktok_ttdlp, url, folder)
+                elif provider == "cobalt" and host in ("x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"):
+                    print(f"Telegram Twitter Cobalt failed: {type(cobalt_error).__name__}; trying FxTwitter", flush=True)
+                    title, path = await asyncio.to_thread(_telegram_download_fxtwitter, url, folder)
                 elif provider != "cobalt" or not (host == "instagram.com" or host.endswith(".instagram.com") or host in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")):
                     raise
                 else:
